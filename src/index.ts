@@ -4,12 +4,14 @@ import express, { type Request, type Response } from "express";
 import { z } from "zod";
 import { execFile, spawn, type ChildProcess } from "child_process";
 import { promisify } from "util";
-import { existsSync } from "fs";
+import { existsSync, readdirSync, statSync, unlinkSync } from "fs";
+import { join, isAbsolute, resolve as resolvePath } from "path";
 
 const execFileAsync = promisify(execFile);
 
 const KUBECONFIG_PATH = process.env.KUBECONFIG_PATH ?? "/tmp/kubeconfig";
 const BUNDLE_PATH = process.env.BUNDLE_PATH;
+const BUNDLES_DIR = process.env.BUNDLES_DIR ?? "/bundles";
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 const PROXY_ADDRESS = process.env.PROXY_ADDRESS ?? "localhost:8080";
 const KUBECTL_TIMEOUT_MS = parseInt(process.env.KUBECTL_TIMEOUT_MS ?? "30000", 10);
@@ -20,6 +22,7 @@ const CLUSTER_READY_TIMEOUT_MS = parseInt(
 
 let bundleProcess: ChildProcess | null = null;
 let bundleReady = false;
+let currentBundlePath: string | null = null;
 
 // ---------------------------------------------------------------------------
 // kubectl helper
@@ -147,6 +150,7 @@ async function startBundle(bundlePath: string): Promise<void> {
       { stdio: ["ignore", "pipe", "pipe"] }
     );
     bundleProcess = child;
+    currentBundlePath = bundlePath;
 
     let settled = false;
     const settle = (fn: () => void) => {
@@ -166,6 +170,7 @@ async function startBundle(bundlePath: string): Promise<void> {
     child.on("exit", (code, signal) => {
       bundleReady = false;
       bundleProcess = null;
+      currentBundlePath = null;
       const reason = signal ? `signal ${signal}` : `code ${code}`;
       console.log(`[MCP] troubleshoot-live exited with ${reason}`);
       settle(() =>
@@ -178,25 +183,91 @@ async function startBundle(bundlePath: string): Promise<void> {
   });
 }
 
-function stopBundle(): void {
-  if (!bundleProcess) return;
-  console.log("[MCP] Stopping troubleshoot-live…");
-  bundleProcess.kill("SIGTERM");
-  // Best-effort SIGKILL fallback if it doesn't die in 5s.
+// Stop the running bundle and wait for the child to exit. Resolves once the
+// process is gone (or immediately if nothing is running).
+async function stopBundle(timeoutMs = 10_000): Promise<void> {
   const child = bundleProcess;
-  setTimeout(() => {
-    if (!child.killed) child.kill("SIGKILL");
-  }, 5_000).unref();
+  if (!child) return;
+  console.log("[MCP] Stopping troubleshoot-live…");
+
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      bundleReady = false;
+      bundleProcess = null;
+      currentBundlePath = null;
+      try {
+        if (existsSync(KUBECONFIG_PATH)) unlinkSync(KUBECONFIG_PATH);
+      } catch {
+        // best-effort cleanup
+      }
+      resolve();
+    };
+
+    child.once("exit", finish);
+    child.kill("SIGTERM");
+    const killTimer = setTimeout(() => {
+      if (!child.killed) child.kill("SIGKILL");
+    }, 5_000);
+    killTimer.unref();
+    const giveUp = setTimeout(finish, timeoutMs);
+    giveUp.unref();
+  });
+}
+
+// Resolve a user-supplied bundle reference into an absolute path inside
+// BUNDLES_DIR. Accepts either a bare filename ("bundle.tar.gz") or a path
+// inside the bundles directory ("/bundles/bundle.tar.gz" or "subdir/x.tgz").
+// Refuses anything that escapes BUNDLES_DIR.
+function resolveBundlePath(input: string): string {
+  const candidate = isAbsolute(input) ? input : join(BUNDLES_DIR, input);
+  const abs = resolvePath(candidate);
+  const root = resolvePath(BUNDLES_DIR);
+  if (!abs.startsWith(root + "/") && abs !== root) {
+    throw new Error(
+      `Bundle path '${input}' is outside the bundles directory (${BUNDLES_DIR}).`
+    );
+  }
+  return abs;
+}
+
+function listBundleFiles(): { path: string; name: string; sizeBytes: number; modified: string }[] {
+  if (!existsSync(BUNDLES_DIR)) return [];
+  const out: { path: string; name: string; sizeBytes: number; modified: string }[] = [];
+  const walk = (dir: string) => {
+    for (const entry of readdirSync(dir)) {
+      const full = join(dir, entry);
+      let s;
+      try {
+        s = statSync(full);
+      } catch {
+        continue;
+      }
+      if (s.isDirectory()) {
+        walk(full);
+      } else if (s.isFile() && /\.(tar\.gz|tgz|tar)$/i.test(entry)) {
+        out.push({
+          path: full,
+          name: entry,
+          sizeBytes: s.size,
+          modified: s.mtime.toISOString(),
+        });
+      }
+    }
+  };
+  walk(BUNDLES_DIR);
+  return out.sort((a, b) => b.modified.localeCompare(a.modified));
 }
 
 // ---------------------------------------------------------------------------
-// MCP server + tools
+// MCP server factory
 // ---------------------------------------------------------------------------
-
-const server = new McpServer({
-  name: "troubleshoot-live-mcp",
-  version: "1.0.0",
-});
+// The SDK's McpServer supports only one transport connection at a time. We
+// create a fresh instance for every /sse request so concurrent (or
+// reconnecting) clients each get their own server. All tool handlers close
+// over the shared module-level state (bundleProcess, bundleReady).
 
 const requireReady = (): { content: [{ type: "text"; text: string }] } | null =>
   bundleReady
@@ -210,37 +281,62 @@ const requireReady = (): { content: [{ type: "text"; text: string }] } | null =>
         ],
       };
 
+function createServer(): McpServer {
+  const server = new McpServer({
+    name: "troubleshoot-live-mcp",
+    version: "1.0.0",
+  });
+
 // --- Bundle lifecycle ---
 
 server.tool(
   "start_bundle",
-  "Start troubleshoot-live with a support bundle file. Call this first if the server did not auto-start with BUNDLE_PATH.",
+  "Load a support bundle into the live cluster. If a different bundle is already loaded it will be unloaded first (~5–60s). Pass either a bare filename ('foo.tar.gz') or an absolute path under /bundles. Use list_bundles to see what's available.",
   {
     bundle_path: z
       .string()
       .describe(
-        "Absolute path to the support bundle .tar.gz inside the container (e.g. /bundles/my-bundle.tar.gz)"
+        "Filename inside /bundles (e.g. 'support-2025-04-01.tar.gz') or absolute path under /bundles"
       ),
   },
   async ({ bundle_path }) => {
-    if (bundleProcess) {
+    let resolved: string;
+    try {
+      resolved = resolveBundlePath(bundle_path);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { content: [{ type: "text", text: msg }] };
+    }
+    if (!existsSync(resolved)) {
       return {
         content: [
           {
             type: "text",
-            text: "troubleshoot-live is already running. Restart the container to load a different bundle.",
+            text: `Bundle file not found: ${resolved}. Use list_bundles to see what's available in ${BUNDLES_DIR}.`,
           },
         ],
       };
     }
-    if (!existsSync(bundle_path)) {
-      return {
-        content: [{ type: "text", text: `Bundle file not found at path: ${bundle_path}` }],
-      };
+
+    if (bundleProcess) {
+      if (currentBundlePath === resolved && bundleReady) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Bundle '${resolved}' is already loaded and ready at ${PROXY_ADDRESS}.`,
+            },
+          ],
+        };
+      }
+      console.log(
+        `[MCP] Switching bundles: '${currentBundlePath}' → '${resolved}'`
+      );
+      await stopBundle();
     }
 
     try {
-      await startBundle(bundle_path);
+      await startBundle(resolved);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return {
@@ -255,8 +351,66 @@ server.tool(
         {
           type: "text",
           text: bundleReady
-            ? `troubleshoot-live started. Kubernetes API is ready at ${PROXY_ADDRESS}.`
-            : "troubleshoot-live started but the API did not become ready in time. Check container logs.",
+            ? `Bundle '${resolved}' loaded. Kubernetes API is ready at ${PROXY_ADDRESS}.`
+            : `Bundle '${resolved}' started but the API did not become ready in time. Check container logs.`,
+        },
+      ],
+    };
+  }
+);
+
+server.tool(
+  "stop_bundle",
+  "Unload the currently loaded support bundle and shut down the in-memory cluster. The MCP server itself stays up.",
+  {},
+  async () => {
+    if (!bundleProcess) {
+      return { content: [{ type: "text", text: "No bundle is currently loaded." }] };
+    }
+    const wasLoaded = currentBundlePath;
+    await stopBundle();
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Unloaded bundle '${wasLoaded}'. Use start_bundle to load another.`,
+        },
+      ],
+    };
+  }
+);
+
+server.tool(
+  "list_bundles",
+  `List support bundles available under ${BUNDLES_DIR}. Returns filenames you can pass to start_bundle.`,
+  {},
+  async () => {
+    const files = listBundleFiles();
+    if (files.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `No bundles found in ${BUNDLES_DIR}. Drop .tar.gz support bundles into ./bundles/ on the host.`,
+          },
+        ],
+      };
+    }
+    const lines = files.map((f) => {
+      const sizeMb = (f.sizeBytes / 1024 / 1024).toFixed(1);
+      const active = f.path === currentBundlePath ? "  ← currently loaded" : "";
+      return `${f.path}\t${sizeMb} MB\t${f.modified}${active}`;
+    });
+    return {
+      content: [
+        {
+          type: "text",
+          text: [
+            `Found ${files.length} bundle(s) in ${BUNDLES_DIR}:`,
+            "",
+            "PATH\tSIZE\tMODIFIED",
+            ...lines,
+          ].join("\n"),
         },
       ],
     };
@@ -265,18 +419,31 @@ server.tool(
 
 server.tool(
   "cluster_status",
-  "Check whether the troubleshoot-live cluster is running and responsive. Returns namespace list on success.",
+  "Check whether the troubleshoot-live cluster is running and responsive. Returns the loaded bundle and namespace list on success.",
   {},
-  async () => ({
-    content: [
-      {
-        type: "text",
-        text: bundleReady
-          ? `Cluster is running at ${PROXY_ADDRESS}.\n\n${await runKubectl(["get", "namespaces"])}`
-          : "Cluster is not running. Use start_bundle to load a support bundle.",
-      },
-    ],
-  })
+  async () => {
+    if (!bundleReady) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Cluster is not running. Use list_bundles to see available bundles, then start_bundle to load one.",
+          },
+        ],
+      };
+    }
+    return {
+      content: [
+        {
+          type: "text",
+          text:
+            `Cluster is running at ${PROXY_ADDRESS}.\n` +
+            `Loaded bundle: ${currentBundlePath}\n\n` +
+            (await runKubectl(["get", "namespaces"])),
+        },
+      ],
+    };
+  }
 );
 
 // --- Namespace & node overview ---
@@ -538,6 +705,9 @@ server.tool(
   }
 );
 
+  return server;
+}
+
 // ---------------------------------------------------------------------------
 // HTTP / SSE transport
 // ---------------------------------------------------------------------------
@@ -554,7 +724,9 @@ app.get("/sse", async (_req: Request, res: Response) => {
     transports.delete(transport.sessionId);
   });
 
-  await server.connect(transport);
+  // Fresh server instance per connection — the SDK only supports one
+  // active transport per McpServer instance.
+  await createServer().connect(transport);
 });
 
 // IMPORTANT: do NOT install express.json() globally — SSEServerTransport reads
@@ -574,8 +746,10 @@ app.get("/health", (_req: Request, res: Response) => {
   res.json({
     status: "ok",
     bundleReady,
+    currentBundle: currentBundlePath,
+    bundlesDir: BUNDLES_DIR,
     kubeconfig: KUBECONFIG_PATH,
-    bundlePath: BUNDLE_PATH ?? null,
+    autoStartBundle: BUNDLE_PATH ?? null,
   });
 });
 
@@ -615,14 +789,14 @@ async function main(): Promise<void> {
     console.log(`[MCP] Health check:       http://localhost:${PORT}/health`);
   });
 
-  const shutdown = (signal: string) => {
+  const shutdown = async (signal: string) => {
     console.log(`[MCP] Received ${signal}, shutting down…`);
-    stopBundle();
+    await stopBundle().catch(() => {});
     httpServer.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 8_000).unref();
   };
-  process.on("SIGINT", () => shutdown("SIGINT"));
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
 }
 
 main().catch((err) => {

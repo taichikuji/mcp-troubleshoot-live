@@ -9,10 +9,11 @@ services:
       # to 3000 inside the container. Change HOST_PORT if 3100 conflicts.
       - "${HOST_PORT:-3100}:3000"
     environment:
-      # Path to the bundle inside the container (/bundles/<filename>).
-      # The server will start troubleshoot-live automatically on boot.
-      # Remove or leave empty to load a bundle manually via the start_bundle tool.
-      - BUNDLE_PATH=${BUNDLE_PATH:-/bundles/bundle.tar.gz}
+      # Optional: bundle to auto-load on startup. If unset, the AI picks one
+      # at runtime via the list_bundles + start_bundle tools (and can switch
+      # between bundles mid-conversation without restarting the container).
+      - BUNDLE_PATH=${BUNDLE_PATH:-}
+      - BUNDLES_DIR=${BUNDLES_DIR:-/bundles}
       - PROXY_ADDRESS=${PROXY_ADDRESS:-localhost:8080}
       - KUBECTL_VERSION=${KUBECTL_VERSION:-v1.29.4}
     volumes:
