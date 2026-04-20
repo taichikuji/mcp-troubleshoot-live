@@ -1,0 +1,40 @@
+# Keep the build context tiny: only what the Dockerfile actually COPYs.
+# Anything not listed here is uploaded to the daemon on every build.
+
+# VCS & local tooling
+.git
+.gitignore
+.gitattributes
+.github
+.vscode
+.idea
+*.swp
+
+# Docs & deploy scripts (not used by the build)
+README.md
+deploy.sh
+docker-compose.yml
+docker-compose.*.yml
+Dockerfile
+.dockerignore
+
+# Local secrets / env
+.env
+.env.*
+!.env.example
+
+# Build outputs (regenerated inside the builder stage)
+dist
+*.tsbuildinfo
+
+# Dependencies (re-installed inside the builder stage)
+node_modules
+
+# Runtime data — bundles are mounted at runtime, never baked into the image
+bundles
+
+# Logs / OS noise
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
