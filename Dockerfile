@@ -37,18 +37,14 @@ COPY --from=builder /app/dist ./dist
 COPY package.json ./
 
 # /bundles holds support bundles (mounted from the host).
-# /cache/kubebuilder-envtest caches envtest binaries (kube-apiserver + etcd)
-# downloaded by troubleshoot-live on first run; mount a named volume here.
-RUN mkdir -p /bundles /cache/kubebuilder-envtest && \
-    chown -R node:node /app /bundles /cache
-
-ENV KUBEBUILDER_ASSETS=/cache/kubebuilder-envtest
+RUN mkdir -p /bundles && \
+    chown -R node:node /app /bundles
 
 USER node
 
 EXPOSE 3000
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-  CMD curl -f http://localhost:3000/health || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+  CMD ["curl", "-f", "http://localhost:3000/health"]
 
 CMD ["node", "dist/index.js"]

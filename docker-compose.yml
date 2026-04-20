@@ -15,13 +15,13 @@ services:
       - BUNDLE_PATH=${BUNDLE_PATH:-}
       - BUNDLES_DIR=${BUNDLES_DIR:-/bundles}
       - PROXY_ADDRESS=${PROXY_ADDRESS:-localhost:8080}
-      - KUBECTL_VERSION=${KUBECTL_VERSION:-v1.29.4}
     volumes:
       # Drop your .tar.gz support bundles into ./bundles/ on the host.
       - ./bundles:/bundles
-      # Cache the envtest binaries (kube-apiserver + etcd) across restarts
-      # so troubleshoot-live doesn't re-download them every time.
-      - envtest-cache:/cache/kubebuilder-envtest
+      # Cache the envtest binaries (kube-apiserver + etcd) across restarts.
+      # Mounted at the default setup-envtest store location so troubleshoot-live
+      # can find binaries it downloaded without needing KUBEBUILDER_ASSETS set.
+      - envtest-cache:/home/node/.local/share/kubebuilder-envtest
 
 volumes:
   envtest-cache:

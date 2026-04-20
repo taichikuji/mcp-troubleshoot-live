@@ -146,3 +146,5 @@ vite.config.ts.timestamp-*
 
 # Cursor/VSCode instructions
 .agent_brain.md
+.cursor/*
+fixtures/*
