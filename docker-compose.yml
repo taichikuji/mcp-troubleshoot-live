@@ -14,6 +14,9 @@ services:
       # between bundles mid-conversation without restarting the container).
       - BUNDLE_PATH=${BUNDLE_PATH:-}
       - BUNDLES_DIR=${BUNDLES_DIR:-/bundles}
+      # Internal address troubleshoot-live binds to inside the container.
+      # kubectl (also inside the container) connects here. Do not change unless
+      # port 8080 conflicts with another process running in the same container.
       - PROXY_ADDRESS=${PROXY_ADDRESS:-localhost:8080}
     volumes:
       # Drop your .tar.gz support bundles into ./bundles/ on the host.

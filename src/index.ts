@@ -17,8 +17,10 @@ const BUNDLES_DIR = process.env.BUNDLES_DIR ?? "/bundles";
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 const PROXY_ADDRESS = process.env.PROXY_ADDRESS ?? "localhost:8080";
 const KUBECTL_TIMEOUT_MS = parseInt(process.env.KUBECTL_TIMEOUT_MS ?? "30000", 10);
+// 5 min default: first bundle load triggers envtest binary download (~185 MB)
+// before the HTTP proxy starts. On slow networks this can exceed 2 minutes.
 const CLUSTER_READY_TIMEOUT_MS = parseInt(
-  process.env.CLUSTER_READY_TIMEOUT_MS ?? "120000",
+  process.env.CLUSTER_READY_TIMEOUT_MS ?? "300000",
   10
 );
 
@@ -354,7 +356,7 @@ function createServer(): McpServer {
           {
             type: "text",
             text: bundleReady
-              ? `Bundle '${resolved}' loaded. Kubernetes API is ready at ${PROXY_ADDRESS}.`
+              ? `Bundle '${resolved}' loaded. Kubernetes API is ready — use the cluster inspection tools to query resources.`
               : `Bundle '${resolved}' started but the API did not become ready in time. Check container logs.`,
           },
         ],
@@ -445,7 +447,7 @@ function createServer(): McpServer {
           {
             type: "text",
             text:
-              `Cluster is running at ${PROXY_ADDRESS}.\n` +
+              `Cluster is running.\n` +
               `Loaded bundle: ${currentBundlePath}\n\n` +
               (await runKubectl(["get", "namespaces"])),
           },
