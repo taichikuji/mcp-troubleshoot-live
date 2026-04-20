@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import express, { type Request, type Response } from "express";
 import { z } from "zod";
 import { execFile, spawn, type ChildProcess } from "child_process";
@@ -763,10 +764,25 @@ app.all("/mcp", async (req: Request, res: Response) => {
     return;
   }
 
-  // POST — existing session or new session initialisation
+  // POST — route to existing session or initialise a new one.
   const sid = req.headers["mcp-session-id"] as string | undefined;
   if (sid && sessions.has(sid)) {
     await sessions.get(sid)!.handleRequest(req, res, req.body);
+    return;
+  }
+
+  // Unknown session ID: the session has expired or the ID is invalid.
+  // Return 404 so spec-compliant clients can detect the stale session and
+  // recover via re-initialization (sending a fresh initialize request without
+  // a session ID).
+  if (sid) {
+    res.status(404).json({ error: "Session not found" });
+    return;
+  }
+
+  // No session ID — only allow new sessions for initialize requests.
+  if (!isInitializeRequest(req.body)) {
+    res.status(400).json({ error: "Bad Request: missing or unknown mcp-session-id" });
     return;
   }
 
