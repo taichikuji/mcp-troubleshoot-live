@@ -70,6 +70,12 @@ web_modules/
 .env.*
 !.env.example
 
+# Support bundles (mount these via Docker volume, never commit them)
+bundles/
+
+# Envtest binary cache
+cache/
+
 # parcel-bundler cache (https://parceljs.org/)
 .cache
 .parcel-cache

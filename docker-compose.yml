@@ -1,0 +1,25 @@
+services:
+  troubleshoot-mcp:
+    build: ./
+    # image: ghcr.io/your-org/troubleshoot-live-mcp
+    restart: unless-stopped
+    container_name: troubleshoot-mcp
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      # Path to the bundle inside the container (/bundles/<filename>).
+      # The server will start troubleshoot-live automatically on boot.
+      # Remove or leave empty to load a bundle manually via the start_bundle tool.
+      - BUNDLE_PATH=${BUNDLE_PATH:-/bundles/bundle.tar.gz}
+      - PORT=3000
+      - PROXY_ADDRESS=${PROXY_ADDRESS:-localhost:8080}
+      - KUBECTL_VERSION=${KUBECTL_VERSION:-v1.29.4}
+    volumes:
+      # Drop your .tar.gz support bundles into ./bundles/ on the host.
+      - ./bundles:/bundles
+      # Cache the envtest binaries (kube-apiserver + etcd) across restarts
+      # so troubleshoot-live doesn't re-download them every time.
+      - envtest-cache:/cache/kubebuilder-envtest
+
+volumes:
+  envtest-cache:
