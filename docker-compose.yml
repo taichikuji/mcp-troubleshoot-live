@@ -5,13 +5,14 @@ services:
     restart: unless-stopped
     container_name: troubleshoot-mcp
     ports:
-      - "${PORT:-3000}:3000"
+      # HOST_PORT is the port exposed on your machine. The app always binds
+      # to 3000 inside the container. Change HOST_PORT if 3100 conflicts.
+      - "${HOST_PORT:-3100}:3000"
     environment:
       # Path to the bundle inside the container (/bundles/<filename>).
       # The server will start troubleshoot-live automatically on boot.
       # Remove or leave empty to load a bundle manually via the start_bundle tool.
       - BUNDLE_PATH=${BUNDLE_PATH:-/bundles/bundle.tar.gz}
-      - PORT=3000
       - PROXY_ADDRESS=${PROXY_ADDRESS:-localhost:8080}
       - KUBECTL_VERSION=${KUBECTL_VERSION:-v1.29.4}
     volumes:

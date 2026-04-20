@@ -77,7 +77,7 @@ else
 fi
 
 # Pull latest version
-if git fetch --all; then
+if git fetch --all && git pull --ff-only; then
     log "$SUCCESS" "Updated to latest commit"
 else
     log "$ERROR" "Git update failed"; exit 1

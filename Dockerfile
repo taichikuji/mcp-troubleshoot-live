@@ -3,12 +3,8 @@ FROM node:22-bookworm-slim AS builder
 
 WORKDIR /app
 
-RUN apt-get update -y && \
-    apt-get install -y --no-install-recommends python3 make g++ && \
-    rm -rf /var/lib/apt/lists/*
-
-COPY package.json ./
-RUN npm install
+COPY package.json package-lock.json ./
+RUN npm ci
 
 COPY tsconfig.json ./
 COPY src/ ./src/
@@ -40,11 +36,15 @@ COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 COPY package.json ./
 
-RUN mkdir /bundles
+# /bundles holds support bundles (mounted from the host).
+# /cache/kubebuilder-envtest caches envtest binaries (kube-apiserver + etcd)
+# downloaded by troubleshoot-live on first run; mount a named volume here.
+RUN mkdir -p /bundles /cache/kubebuilder-envtest && \
+    chown -R node:node /app /bundles /cache
 
-# troubleshoot-live downloads kube-apiserver + etcd binaries on first use.
-# Point them at a persistent path so a named volume can cache them.
 ENV KUBEBUILDER_ASSETS=/cache/kubebuilder-envtest
+
+USER node
 
 EXPOSE 3000
 
