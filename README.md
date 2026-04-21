@@ -94,11 +94,16 @@ What happens:
 3. LLM runs the curl via the shell tool. Server streams the file to
    `/tmp/troubleshoot-mcp-uploads/<uuid>-acme-prod.tar.gz` and returns
    `{ path, name, sizeBytes }`.
-4. LLM calls `start_bundle({ bundle_path: "<returned path>" })`. troubleshoot-live
-   spins up an in-memory cluster from the bundle.
-5. LLM uses `get_pods`, `get_events`, `get_pod_logs`, `describe_resource`,
-   `kubectl_run`, etc. to triage.
-6. When done, `stop_bundle` shuts the cluster down and deletes the uploaded
+4. LLM calls `start_bundle({ bundle_path: "<returned path>" })`. It returns
+   **immediately** with `status=loading` (cold load) or `status=ready` (warm).
+5. LLM polls `cluster_status` every few seconds until it reports `status=ready`.
+   Cold loads take 1–3 minutes (envtest binary download); warm loads ~5–30s.
+   This polling pattern keeps the LLM client from hitting its tool-call
+   timeout (Cursor/Claude default ~60s).
+6. Once ready, LLM uses `get_pods`, `get_events`, `get_pod_logs`,
+   `describe_resource`, `kubectl_run`, etc. to triage. Inspection tools called
+   while a load is still in progress refuse with a "still loading" hint.
+7. When done, `stop_bundle` shuts the cluster down and deletes the uploaded
    file. The MCP server itself stays up for the next bundle.
 
 ## Option A: zero-copy via local filesystem share
@@ -187,9 +192,9 @@ Build-time:
 | --- | --- |
 | `prepare_upload` | Returns a `curl` command the LLM runs from the user's shell to push a local bundle to the server. Call FIRST when the bundle lives only on the user's machine. |
 | `list_bundles` | List `.tar.gz` / `.tgz` / `.tar` bundles already in `/bundles` (mode A). |
-| `start_bundle` | Load a bundle by filename in `/bundles`, absolute path under `/bundles`, or path/name returned by `prepare_upload`. Switching unloads the previous bundle automatically. |
+| `start_bundle` | Load a bundle by filename in `/bundles`, absolute path under `/bundles`, or path/name returned by `prepare_upload`. Returns immediately with `status=loading` or `status=ready` — poll `cluster_status` until ready. Switching unloads the previous bundle automatically. |
 | `stop_bundle` | Unload the current bundle, shut down the in-memory cluster, and delete the file IF it was uploaded. |
-| `cluster_status` | Health check, currently loaded bundle, and namespace list. |
+| `cluster_status` | Reports one of `idle` / `loading` / `ready` / `failed` (with crash detail). Use to poll after `start_bundle` and to confirm the cluster is responsive. On `ready` also returns the namespace list. |
 | `list_namespaces` | `kubectl get namespaces -o wide`. |
 | `get_nodes` | `kubectl get nodes -o wide`. |
 | `get_pods` | List pods, optionally scoped to a namespace. |
@@ -207,7 +212,8 @@ Build-time:
 - `GET /sse` + `POST /messages?sessionId=…` — legacy MCP SSE transport.
 - `PUT /bundles/upload/:name` — raw bundle upload. `name` must match
   `[A-Za-z0-9._-]+\.(tar\.gz|tgz|tar)`. Returns `201 {path, name, sizeBytes}`.
-- `GET /health` — `{ status, bundleReady, currentBundle, bundlesDir, uploadDir, kubeconfig, autoStartBundle }`.
+  Partial uploads are deleted if the client aborts mid-stream.
+- `GET /health` — `{ status, bundleReady, bundleLoading, bundleLoadError, currentBundle, bundlesDir, uploadDir, kubeconfig, autoStartBundle }`.
 
 ## Prompting Cursor
 
@@ -231,9 +237,10 @@ when to upload and when not to, but you can be explicit:
 
 > Now switch to `acme-staging.tar.gz` so I can compare.
 
-`start_bundle` tears the old envtest cluster down, starts a new one, and the
-conversation continues. Use `stop_bundle` to free resources (and delete the
-upload, if it was one).
+`start_bundle` tears the old envtest cluster down and kicks off a new one,
+returning immediately. The LLM polls `cluster_status` until the new bundle
+reports `ready` and then continues the conversation. Use `stop_bundle` to free
+resources (and delete the upload, if it was one).
 
 ### Triage prompts
 

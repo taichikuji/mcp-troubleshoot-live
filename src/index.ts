@@ -39,6 +39,9 @@ const PUBLIC_URL = process.env.PUBLIC_URL ?? `http://localhost:${PORT}`;
 
 let bundleProcess: ChildProcess | null = null;
 let bundleReady = false;
+// Loading flag so cluster_status can report "still loading" — keeps LLM tool-call timeouts (~60s) from blocking on cold loads.
+let bundleLoading = false;
+let bundleLoadError: string | null = null;
 let currentBundlePath: string | null = null;
 
 // Tracks files we own via the upload endpoint; /bundles paths are never deleted.
@@ -190,7 +193,11 @@ async function startBundle(bundlePath: string): Promise<void> {
     child.stdout?.on("data", (d: Buffer) => captureLine("stdout", d));
     child.stderr?.on("data", (d: Buffer) => captureLine("stderr", d));
 
-    child.on("error", (err) => settle(() => reject(err)));
+    child.on("error", (err) => {
+      bundleLoading = false;
+      bundleLoadError = err.message;
+      settle(() => reject(err));
+    });
     child.on("exit", (code, signal) => {
       bundleReady = false;
       bundleProcess = null;
@@ -201,9 +208,13 @@ async function startBundle(bundlePath: string): Promise<void> {
       console.log(`[MCP] troubleshoot-live exited with ${reason}`);
       const output = outputLines.join("\n").trim();
       const detail = output ? `\n\nProcess output:\n${output}` : "";
-      settle(() =>
-        reject(new Error(`troubleshoot-live exited before becoming ready (${reason})${detail}`))
-      );
+      const msg = `troubleshoot-live exited before becoming ready (${reason})${detail}`;
+      // If readyWatch hasn't already flipped state, do it here so cluster_status surfaces the crash.
+      if (bundleLoading) {
+        bundleLoading = false;
+        bundleLoadError = msg;
+      }
+      settle(() => reject(new Error(msg)));
     });
 
     // Brief grace period before the caller starts polling.
@@ -225,6 +236,8 @@ async function stopBundle(timeoutMs = 10_000): Promise<void> {
       if (done) return;
       done = true;
       bundleReady = false;
+      bundleLoading = false;
+      bundleLoadError = null;
       bundleProcess = null;
       currentBundlePath = null;
       try { if (existsSync(KUBECONFIG_PATH)) unlinkSync(KUBECONFIG_PATH); } catch {}
@@ -331,18 +344,18 @@ function listBundleFiles(): { path: string; name: string; sizeBytes: number; mod
 }
 
 // Fresh McpServer per session; tool handlers close over the shared module-level state.
-const requireReady = (): { content: [{ type: "text"; text: string }]; isError: true } | null =>
-  bundleReady
-    ? null
-    : {
-        isError: true,
-        content: [
-          {
-            type: "text",
-            text: "Cluster is not ready. Use start_bundle to load a support bundle, or check container logs.",
-          },
-        ],
-      };
+const requireReady = (): { content: [{ type: "text"; text: string }]; isError: true } | null => {
+  if (bundleReady) return null;
+  let text: string;
+  if (bundleLoading) {
+    text = `Cluster is still loading bundle '${currentBundlePath}'. Poll cluster_status every few seconds until it reports ready, then retry this tool.`;
+  } else if (bundleLoadError) {
+    text = `Last bundle load failed:\n${bundleLoadError}\nCall start_bundle again or pick a different bundle.`;
+  } else {
+    text = "Cluster is not ready. Use start_bundle to load a support bundle, or check container logs.";
+  }
+  return { isError: true, content: [{ type: "text", text }] };
+};
 
 function createServer(): McpServer {
   const server = new McpServer(
@@ -358,9 +371,13 @@ function createServer(): McpServer {
         "   `path` (or `name`) to `start_bundle`.",
         "2. If the bundle is already on the MCP server, call `list_bundles` to discover names,",
         "   then `start_bundle <name>` directly — no upload needed.",
-        "3. After `start_bundle` reports ready, use `get_pods`, `get_events`, `get_pod_logs`,",
-        "   `describe_resource`, etc. to triage. Use `kubectl_run` for read-only ad-hoc queries.",
-        "4. When done, call `stop_bundle`. Uploaded bundles are deleted from the server then;",
+        "3. `start_bundle` returns IMMEDIATELY with status='loading' (or 'ready' if already",
+        "   loaded). Then poll `cluster_status` every few seconds until it reports 'ready'.",
+        "   Cold loads can take 1–3 minutes (envtest binary download); warm loads ~5–30s.",
+        "   Do NOT call other inspection tools until `cluster_status` says 'ready'.",
+        "4. Once ready, use `get_pods`, `get_events`, `get_pod_logs`, `describe_resource`,",
+        "   etc. to triage. Use `kubectl_run` for read-only ad-hoc queries.",
+        "5. When done, call `stop_bundle`. Uploaded bundles are deleted from the server then;",
         "   bundles that lived under /bundles are left alone.",
         "",
         "Do NOT run troubleshoot-live or kubectl directly on the user's machine; this MCP",
@@ -427,7 +444,7 @@ function createServer(): McpServer {
     "start_bundle",
     {
       description:
-        "Load a support bundle into the live cluster. If a different bundle is already loaded it will be unloaded first (~5–60s). Pass either: (a) a bare filename in /bundles, (b) an absolute path under /bundles, or (c) the path/name returned by `prepare_upload`. If the bundle lives only on the user's local machine, call `prepare_upload` FIRST.",
+        "Load a support bundle into the live cluster. Returns IMMEDIATELY with status='ready' (warm, already loaded) or status='loading' (apiserver not yet up). If status is 'loading', poll `cluster_status` every few seconds until it reports 'ready' before calling other inspection tools. Cold loads take 1–3 minutes (envtest binary download); warm loads ~5–30s. Pass: (a) a bare filename in /bundles, (b) an absolute path under /bundles, or (c) the path/name returned by `prepare_upload`. If the bundle lives only on the user's local machine, call `prepare_upload` FIRST.",
       inputSchema: {
         bundle_path: z
           .string()
@@ -470,7 +487,17 @@ function createServer(): McpServer {
             content: [
               {
                 type: "text",
-                text: `Bundle '${resolved}' is already loaded and ready at ${PROXY_ADDRESS}.`,
+                text: `status=ready. Bundle '${resolved}' is already loaded at ${PROXY_ADDRESS}.`,
+              },
+            ],
+          };
+        }
+        if (currentBundlePath === resolved && bundleLoading) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `status=loading. Bundle '${resolved}' is already being loaded. Poll cluster_status every few seconds until it reports ready.`,
               },
             ],
           };
@@ -480,25 +507,42 @@ function createServer(): McpServer {
       }
 
       bundleReady = false;
+      bundleLoading = true;
+      bundleLoadError = null;
       try {
+        // Resolves after the 2s grace period; child keeps running in background.
         await startBundle(resolved);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        bundleLoading = false;
+        bundleLoadError = msg;
         return {
           isError: true,
           content: [{ type: "text", text: `Failed to start troubleshoot-live: ${msg}` }],
         };
       }
-      console.log("[MCP] Waiting for Kubernetes API to become ready…");
-      bundleReady = await waitForCluster();
+
+      // Background readiness watch; lets us return immediately so the LLM client doesn't hit its tool-call timeout.
+      const startedFor = resolved;
+      void (async () => {
+        console.log("[MCP] Waiting for Kubernetes API to become ready…");
+        const ok = await waitForCluster();
+        // Guard: another start_bundle/stop_bundle may have superseded us.
+        if (currentBundlePath !== startedFor) return;
+        bundleReady = ok;
+        bundleLoading = false;
+        if (!ok && !bundleLoadError) {
+          bundleLoadError = `Kubernetes API did not become ready within ${Math.round(
+            CLUSTER_READY_TIMEOUT_MS / 1000
+          )}s.`;
+        }
+      })();
 
       return {
         content: [
           {
             type: "text",
-            text: bundleReady
-              ? `Bundle '${resolved}' loaded. Kubernetes API is ready — use the cluster inspection tools to query resources.`
-              : `Bundle '${resolved}' started but the API did not become ready in time. Check container logs.`,
+            text: `status=loading. Bundle '${resolved}' is starting. Poll cluster_status every few seconds until it reports ready before using other inspection tools.`,
           },
         ],
       };
@@ -571,15 +615,39 @@ function createServer(): McpServer {
     "cluster_status",
     {
       description:
-        "Check whether the troubleshoot-live cluster is running and responsive. Returns the loaded bundle and namespace list on success.",
+        "Report the cluster's load state. Use this to poll after start_bundle. Returns one of: status=ready (use inspection tools now), status=loading (poll again in a few seconds), status=failed (load crashed; includes reason), status=idle (no bundle loaded).",
     },
     async () => {
-      if (!bundleReady) {
+      if (bundleReady) {
         return {
           content: [
             {
               type: "text",
-              text: "Cluster is not running. Use list_bundles to see available bundles, then start_bundle to load one.",
+              text:
+                `status=ready\n` +
+                `Loaded bundle: ${currentBundlePath}\n\n` +
+                (await runKubectl(["get", "namespaces"])),
+            },
+          ],
+        };
+      }
+      if (bundleLoading) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `status=loading\nLoading bundle: ${currentBundlePath}\nPoll cluster_status again in a few seconds. Cold loads can take 1–3 minutes.`,
+            },
+          ],
+        };
+      }
+      if (bundleLoadError) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `status=failed\nLast load error:\n${bundleLoadError}`,
             },
           ],
         };
@@ -588,10 +656,7 @@ function createServer(): McpServer {
         content: [
           {
             type: "text",
-            text:
-              `Cluster is running.\n` +
-              `Loaded bundle: ${currentBundlePath}\n\n` +
-              (await runKubectl(["get", "namespaces"])),
+            text: "status=idle\nNo bundle loaded. Use list_bundles to see available bundles, then start_bundle to load one.",
           },
         ],
       };
@@ -971,6 +1036,10 @@ app.put("/bundles/upload/:name", (req: Request, res: Response) => {
     }
   });
   req.on("error", (err) => abort(500, err.message));
+  // Client aborted mid-stream: 'close' fires without 'error'/'end', so without this a partial file orphans until the TTL sweep.
+  req.on("close", () => {
+    if (!req.complete) abort(499, "Client closed connection before upload completed");
+  });
   ws.on("error", (err) => abort(500, err.message));
   ws.on("finish", () => {
     if (aborted) return;
@@ -986,6 +1055,8 @@ app.get("/health", (_req: Request, res: Response) => {
   res.json({
     status: "ok",
     bundleReady,
+    bundleLoading,
+    bundleLoadError,
     currentBundle: currentBundlePath,
     bundlesDir: BUNDLES_DIR,
     uploadDir: UPLOAD_DIR,
