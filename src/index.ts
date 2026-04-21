@@ -7,7 +7,15 @@ import { z } from "zod";
 import { execFile, spawn, type ChildProcess } from "child_process";
 import { randomUUID } from "crypto";
 import { promisify } from "util";
-import { existsSync, readdirSync, statSync, unlinkSync } from "fs";
+import {
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+} from "fs";
 import { join, isAbsolute, resolve as resolvePath } from "path";
 
 const execFileAsync = promisify(execFile);
@@ -25,9 +33,37 @@ const CLUSTER_READY_TIMEOUT_MS = parseInt(
   10
 );
 
+// --- Upload (option B: client-side curl push) ----------------------------
+// Uploads land here, OUTSIDE BUNDLES_DIR, so they never pollute the user's
+// host-mounted bundles folder. Wiped on container start; idle files older
+// than UPLOAD_TTL_MS are reaped on a timer; the file currently loaded is
+// always preserved.
+const UPLOAD_DIR = process.env.UPLOAD_DIR ?? "/tmp/troubleshoot-mcp-uploads";
+const MAX_UPLOAD_BYTES = parseInt(
+  process.env.MAX_UPLOAD_BYTES ?? String(5 * 1024 * 1024 * 1024), // 5 GB
+  10
+);
+const UPLOAD_TTL_MS = parseInt(
+  process.env.UPLOAD_TTL_MS ?? String(6 * 60 * 60 * 1000), // 6 h
+  10
+);
+const UPLOAD_SWEEP_INTERVAL_MS = parseInt(
+  process.env.UPLOAD_SWEEP_INTERVAL_MS ?? String(30 * 60 * 1000), // 30 min
+  10
+);
+// Public URL the user's machine uses to reach this MCP. Default assumes
+// `docker compose up` on the same host the LLM client runs on. For a remote
+// deployment (e.g. MCP on Ubuntu VM, Cursor on Mac), set PUBLIC_URL to the
+// reachable address — used only to render the curl command in prepare_upload.
+const PUBLIC_URL = process.env.PUBLIC_URL ?? `http://localhost:${PORT}`;
+
 let bundleProcess: ChildProcess | null = null;
 let bundleReady = false;
 let currentBundlePath: string | null = null;
+
+// Files we created via the upload endpoint. Used so stop_bundle can delete
+// the underlying file (pure /bundles paths are user-owned and never touched).
+const uploadedPaths = new Set<string>();
 
 // ---------------------------------------------------------------------------
 // kubectl helper
@@ -200,6 +236,7 @@ async function stopBundle(timeoutMs = 10_000): Promise<void> {
     const finish = () => {
       if (done) return;
       done = true;
+      const wasPath = currentBundlePath;
       bundleReady = false;
       bundleProcess = null;
       currentBundlePath = null;
@@ -208,6 +245,7 @@ async function stopBundle(timeoutMs = 10_000): Promise<void> {
       } catch {
         // best-effort cleanup
       }
+      maybeDeleteUpload(wasPath);
       resolve();
     };
 
@@ -222,20 +260,86 @@ async function stopBundle(timeoutMs = 10_000): Promise<void> {
   });
 }
 
-// Resolve a user-supplied bundle reference into an absolute path inside
-// BUNDLES_DIR. Accepts either a bare filename ("bundle.tar.gz") or a path
-// inside the bundles directory ("/bundles/bundle.tar.gz" or "subdir/x.tgz").
-// Refuses anything that escapes BUNDLES_DIR.
+// Resolve a user-supplied bundle reference into an absolute path. Accepts:
+//   - a bare filename ("bundle.tar.gz") — resolved against BUNDLES_DIR
+//   - an absolute path under BUNDLES_DIR ("/bundles/foo.tar.gz")
+//   - an absolute path under UPLOAD_DIR (returned by the upload endpoint)
+// Refuses anything that escapes both roots.
 function resolveBundlePath(input: string): string {
   const candidate = isAbsolute(input) ? input : join(BUNDLES_DIR, input);
   const abs = resolvePath(candidate);
-  const root = resolvePath(BUNDLES_DIR);
-  if (!abs.startsWith(root + "/") && abs !== root) {
+  const roots = [resolvePath(BUNDLES_DIR), resolvePath(UPLOAD_DIR)];
+  const ok = roots.some((r) => abs === r || abs.startsWith(r + "/"));
+  if (!ok) {
     throw new Error(
-      `Bundle path '${input}' is outside the bundles directory (${BUNDLES_DIR}).`
+      `Bundle path '${input}' is outside the allowed roots (${BUNDLES_DIR}, ${UPLOAD_DIR}).`
     );
   }
   return abs;
+}
+
+// --- Upload helpers ------------------------------------------------------
+
+// Restrict to a safe charset and a known archive extension. Strips any path
+// components from the input so callers can't escape UPLOAD_DIR.
+function sanitizeFilename(raw: string): string | null {
+  const base = raw.replace(/^.*[\\/]/, "");
+  if (!base || base.length > 255) return null;
+  if (base.startsWith(".")) return null;
+  if (!/^[A-Za-z0-9._-]+$/.test(base)) return null;
+  if (!/\.(tar\.gz|tgz|tar)$/i.test(base)) return null;
+  return base;
+}
+
+function shellQuote(s: string): string {
+  // Single-quote wrap; close-quote-escape-quote-reopen for embedded quotes.
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+// Wipe and recreate UPLOAD_DIR. Called once at startup so a previous crash
+// can't leave orphan files lying around the container's tmpfs.
+function initUploadDir(): void {
+  try {
+    rmSync(UPLOAD_DIR, { recursive: true, force: true });
+  } catch {
+    // best-effort
+  }
+  mkdirSync(UPLOAD_DIR, { recursive: true });
+}
+
+// Periodic reaper: delete idle upload files older than UPLOAD_TTL_MS.
+// Never deletes the file currently loaded in troubleshoot-live.
+function sweepUploads(): void {
+  if (!existsSync(UPLOAD_DIR)) return;
+  const now = Date.now();
+  for (const entry of readdirSync(UPLOAD_DIR)) {
+    const full = join(UPLOAD_DIR, entry);
+    if (full === currentBundlePath) continue;
+    try {
+      const s = statSync(full);
+      if (!s.isFile()) continue;
+      if (now - s.mtimeMs > UPLOAD_TTL_MS) {
+        unlinkSync(full);
+        uploadedPaths.delete(full);
+        console.log(`[MCP] Reaped idle upload: ${full}`);
+      }
+    } catch {
+      // file may have vanished mid-loop; ignore
+    }
+  }
+}
+
+// Delete an upload file IFF we own it. Pure /bundles paths are skipped so
+// we never touch user-owned host-mounted files.
+function maybeDeleteUpload(p: string | null): void {
+  if (!p || !uploadedPaths.has(p)) return;
+  try {
+    unlinkSync(p);
+    console.log(`[MCP] Deleted uploaded bundle after stop: ${p}`);
+  } catch {
+    // already gone
+  }
+  uploadedPaths.delete(p);
 }
 
 function listBundleFiles(): { path: string; name: string; sizeBytes: number; modified: string }[] {
@@ -286,23 +390,103 @@ const requireReady = (): { content: [{ type: "text"; text: string }] } | null =>
       };
 
 function createServer(): McpServer {
-  const server = new McpServer({
-    name: "troubleshoot-live-mcp",
-    version: "1.0.0",
-  });
+  const server = new McpServer(
+    {
+      name: "troubleshoot-live-mcp",
+      version: "1.0.0",
+    },
+    {
+      instructions: [
+        "Tools for inspecting Kubernetes support bundles via troubleshoot-live.",
+        "",
+        "WORKFLOW for investigating a bundle:",
+        "1. If the user names a bundle file on THEIR local machine (e.g. ~/Downloads/foo.tar.gz),",
+        "   call `prepare_upload` FIRST. It returns a curl command. Run that curl via your",
+        "   shell tool on the user's machine. Parse the JSON response and pass the returned",
+        "   `path` (or `name`) to `start_bundle`.",
+        "2. If the bundle is already on the MCP server, call `list_bundles` to discover names,",
+        "   then `start_bundle <name>` directly — no upload needed.",
+        "3. After `start_bundle` reports ready, use `get_pods`, `get_events`, `get_pod_logs`,",
+        "   `describe_resource`, etc. to triage. Use `kubectl_run` for read-only ad-hoc queries.",
+        "4. When done, call `stop_bundle`. Uploaded bundles are deleted from the server then;",
+        "   bundles that lived under /bundles are left alone.",
+        "",
+        "Do NOT run troubleshoot-live or kubectl directly on the user's machine; this MCP",
+        "owns the live cluster.",
+      ].join("\n"),
+    }
+  );
 
   // --- Bundle lifecycle ---
+
+  server.registerTool(
+    "prepare_upload",
+    {
+      description:
+        "Use this FIRST when the user wants to investigate a support bundle that lives on their local machine and is not yet on the MCP server. Returns a `curl` command to push the bundle from the user's machine to the MCP server's upload endpoint. Run that curl via your shell tool, then pass the returned path/name to `start_bundle`. If the bundle already lives in the server's bundles directory, skip this and use `list_bundles` + `start_bundle` instead.",
+      inputSchema: {
+        local_path: z
+          .string()
+          .describe(
+            "Absolute path to the support bundle on the user's local machine (e.g. /Users/alice/Downloads/foo.tar.gz)."
+          ),
+      },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+      },
+    },
+    async ({ local_path }) => {
+      const base = local_path.replace(/^.*[\\/]/, "");
+      const safe = sanitizeFilename(base);
+      if (!safe) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `Cannot derive a safe filename from '${base}'. The bundle filename must end in .tar.gz, .tgz, or .tar and contain only letters, digits, '.', '-', '_'. Rename the file locally and retry.`,
+            },
+          ],
+        };
+      }
+      const url = `${PUBLIC_URL.replace(/\/+$/, "")}/bundles/upload/${encodeURIComponent(safe)}`;
+      const cmd = `curl -fsS --upload-file ${shellQuote(local_path)} ${shellQuote(url)}`;
+      const ttlH = Math.round(UPLOAD_TTL_MS / 3_600_000);
+      const maxGb = (MAX_UPLOAD_BYTES / (1024 * 1024 * 1024)).toFixed(1);
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              "Run this exact command on the user's machine via your shell tool:",
+              "",
+              cmd,
+              "",
+              "It will print a JSON response shaped like:",
+              `  { "path": "${UPLOAD_DIR}/<uuid>-${safe}", "name": "<uuid>-${safe}", "sizeBytes": N }`,
+              "",
+              `Then call start_bundle with bundle_path set to that "path" (or "name"). The`,
+              `uploaded file is auto-deleted when stop_bundle runs, when this container`,
+              `restarts, or after ${ttlH}h of inactivity. Max upload size: ${maxGb} GB.`,
+            ].join("\n"),
+          },
+        ],
+      };
+    }
+  );
 
   server.registerTool(
     "start_bundle",
     {
       description:
-        "Load a support bundle into the live cluster. If a different bundle is already loaded it will be unloaded first (~5–60s). Pass either a bare filename ('foo.tar.gz') or an absolute path under /bundles. Use list_bundles to see what's available.",
+        "Load a support bundle into the live cluster. If a different bundle is already loaded it will be unloaded first (~5–60s). Pass either: (a) a bare filename in /bundles, (b) an absolute path under /bundles, or (c) the path/name returned by `prepare_upload`. If the bundle lives only on the user's local machine, call `prepare_upload` FIRST.",
       inputSchema: {
         bundle_path: z
           .string()
           .describe(
-            "Filename inside /bundles (e.g. 'support-2025-04-01.tar.gz') or absolute path under /bundles"
+            "Filename in /bundles (e.g. 'support-2025-04-01.tar.gz'), absolute path under /bundles, or the 'path'/'name' returned by prepare_upload."
           ),
       },
     },
@@ -316,10 +500,19 @@ function createServer(): McpServer {
       }
       if (!existsSync(resolved)) {
         return {
+          isError: true,
           content: [
             {
               type: "text",
-              text: `Bundle file not found: ${resolved}. Use list_bundles to see what's available in ${BUNDLES_DIR}.`,
+              text: [
+                `Bundle file not found on the MCP server at: ${resolved}`,
+                "",
+                "Next steps:",
+                `  - If the bundle is on the user's local machine, call prepare_upload first`,
+                `    (returns a curl command that uploads it to ${UPLOAD_DIR}).`,
+                `  - If the bundle should already be on the server, call list_bundles to see`,
+                `    what's actually available in ${BUNDLES_DIR}.`,
+              ].join("\n"),
             },
           ],
         };
@@ -400,7 +593,11 @@ function createServer(): McpServer {
           content: [
             {
               type: "text",
-              text: `No bundles found in ${BUNDLES_DIR}. Drop .tar.gz support bundles into ./bundles/ on the host.`,
+              text:
+                `No bundles found in ${BUNDLES_DIR}.\n` +
+                `If the user has a bundle on their local machine, call prepare_upload to ` +
+                `upload it. Otherwise drop .tar.gz support bundles into the host directory ` +
+                `mounted at ${BUNDLES_DIR}.`,
             },
           ],
         };
@@ -819,12 +1016,74 @@ app.post("/messages", async (req: Request, res: Response) => {
   await transport.handlePostMessage(req, res);
 });
 
+// Bundle upload endpoint. PUT a raw .tar.gz body and we stream it straight to
+// disk in UPLOAD_DIR with a uuid prefix so concurrent uploads can't collide.
+// Intentionally NOT mounted under any body parser — we need the request stream
+// untouched. Aborts cleanly on size overflow.
+app.put("/bundles/upload/:name", (req: Request, res: Response) => {
+  const safe = sanitizeFilename(req.params.name ?? "");
+  if (!safe) {
+    res.status(400).json({
+      error:
+        "Invalid filename. Must end in .tar.gz, .tgz, or .tar and contain only letters, digits, '.', '-', '_'.",
+    });
+    return;
+  }
+
+  const declared = parseInt(req.headers["content-length"] ?? "0", 10);
+  if (declared && declared > MAX_UPLOAD_BYTES) {
+    res.status(413).json({ error: `File too large; max ${MAX_UPLOAD_BYTES} bytes` });
+    return;
+  }
+
+  // Disable per-request timeouts; large bundles over slow networks take time.
+  req.setTimeout(0);
+  res.setTimeout(0);
+
+  const id = randomUUID();
+  const dest = join(UPLOAD_DIR, `${id}-${safe}`);
+  const ws = createWriteStream(dest);
+  let bytes = 0;
+  let aborted = false;
+
+  const abort = (status: number, message: string) => {
+    if (aborted) return;
+    aborted = true;
+    try { ws.destroy(); } catch {}
+    try { unlinkSync(dest); } catch {}
+    if (!res.headersSent) res.status(status).json({ error: message });
+  };
+
+  req.on("data", (chunk: Buffer) => {
+    bytes += chunk.length;
+    if (bytes > MAX_UPLOAD_BYTES) {
+      abort(413, `File too large; max ${MAX_UPLOAD_BYTES} bytes`);
+      req.destroy();
+    }
+  });
+  req.on("error", (err) => abort(500, err.message));
+  ws.on("error", (err) => abort(500, err.message));
+  ws.on("finish", () => {
+    if (aborted) return;
+    uploadedPaths.add(dest);
+    console.log(`[MCP] Received upload: ${dest} (${bytes} bytes)`);
+    res.status(201).json({
+      path: dest,
+      name: `${id}-${safe}`,
+      sizeBytes: bytes,
+    });
+  });
+
+  req.pipe(ws);
+});
+
 app.get("/health", (_req: Request, res: Response) => {
   res.json({
     status: "ok",
     bundleReady,
     currentBundle: currentBundlePath,
     bundlesDir: BUNDLES_DIR,
+    uploadDir: UPLOAD_DIR,
     kubeconfig: KUBECONFIG_PATH,
     autoStartBundle: BUNDLE_PATH ?? null,
   });
@@ -835,6 +1094,14 @@ app.get("/health", (_req: Request, res: Response) => {
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
+  initUploadDir();
+  console.log(
+    `[MCP] Upload dir: ${UPLOAD_DIR} (max ${(MAX_UPLOAD_BYTES / 1024 / 1024 / 1024).toFixed(1)} GB, TTL ${Math.round(UPLOAD_TTL_MS / 3_600_000)}h)`
+  );
+  console.log(`[MCP] Public URL for uploads: ${PUBLIC_URL}`);
+  const sweepTimer = setInterval(sweepUploads, UPLOAD_SWEEP_INTERVAL_MS);
+  sweepTimer.unref();
+
   if (BUNDLE_PATH) {
     if (!existsSync(BUNDLE_PATH)) {
       console.warn(

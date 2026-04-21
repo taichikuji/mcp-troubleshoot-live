@@ -18,8 +18,20 @@ services:
       # kubectl (also inside the container) connects here. Do not change unless
       # port 8080 conflicts with another process running in the same container.
       - PROXY_ADDRESS=${PROXY_ADDRESS:-localhost:8080}
+      # Public URL the user's MCP client (e.g. Cursor on a Mac) uses to reach
+      # this server. Used by the prepare_upload tool to render a curl command
+      # the LLM tells the user (or runs via shell) to push a local bundle.
+      # Set this whenever the MCP is NOT on the same host as the LLM client.
+      # Examples: http://192.168.64.10:3100, http://my-vm.local:3100
+      - PUBLIC_URL=${PUBLIC_URL:-http://localhost:${HOST_PORT:-3100}}
+      # Upload limits + cleanup. Uploads land in /tmp inside the container,
+      # are wiped on container restart, deleted on stop_bundle, and reaped
+      # after UPLOAD_TTL_MS of inactivity. Defaults are 5 GB / 6 h.
+      - MAX_UPLOAD_BYTES=${MAX_UPLOAD_BYTES:-5368709120}
+      - UPLOAD_TTL_MS=${UPLOAD_TTL_MS:-21600000}
     volumes:
-      # Drop your .tar.gz support bundles into ./bundles/ on the host.
+      # Optional: drop .tar.gz bundles here for direct loading without upload.
+      # Uploaded bundles live in the container's /tmp and never touch this dir.
       - ./bundles:/bundles
       # Cache the envtest binaries (kube-apiserver + etcd) across restarts.
       # Mounted at the default setup-envtest store location so troubleshoot-live
