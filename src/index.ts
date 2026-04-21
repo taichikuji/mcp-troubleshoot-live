@@ -7,6 +7,7 @@ import { z } from "zod";
 import { execFile, spawn, type ChildProcess } from "child_process";
 import { randomUUID } from "crypto";
 import { promisify } from "util";
+import { AsyncLocalStorage } from "async_hooks";
 import {
   createWriteStream,
   existsSync,
@@ -34,8 +35,23 @@ const UPLOAD_DIR = process.env.UPLOAD_DIR ?? "/tmp/troubleshoot-mcp-uploads";
 const MAX_UPLOAD_BYTES = parseInt(process.env.MAX_UPLOAD_BYTES ?? String(5 * 1024 * 1024 * 1024), 10);
 const UPLOAD_TTL_MS = parseInt(process.env.UPLOAD_TTL_MS ?? String(6 * 60 * 60 * 1000), 10);
 const UPLOAD_SWEEP_INTERVAL_MS = parseInt(process.env.UPLOAD_SWEEP_INTERVAL_MS ?? String(30 * 60 * 1000), 10);
-// URL the user's machine uses to reach this MCP. Set when MCP and client are on different hosts.
-const PUBLIC_URL = process.env.PUBLIC_URL ?? `http://localhost:${PORT}`;
+// Override for the upload base URL; normally we derive per-request from Host (+ X-Forwarded-*). Empty string treated as unset.
+const PUBLIC_URL_OVERRIDE = (process.env.PUBLIC_URL ?? "").trim() || null;
+
+// Per-request base URL so prepare_upload uses the host the client actually reached us on.
+const requestContext = new AsyncLocalStorage<{ baseUrl: string }>();
+
+function requestBaseUrl(req: Request): string {
+  // trust-proxy gets req.protocol from X-Forwarded-Proto, but req.get('host') ignores X-Forwarded-Host — check it explicitly.
+  const proto = req.protocol || "http";
+  const fwdHost = (req.get("x-forwarded-host") ?? "").split(",")[0]?.trim();
+  const host = fwdHost || req.get("host");
+  return host ? `${proto}://${host}` : `http://localhost:${PORT}`;
+}
+
+function uploadBaseUrl(): string {
+  return PUBLIC_URL_OVERRIDE ?? requestContext.getStore()?.baseUrl ?? `http://localhost:${PORT}`;
+}
 
 let bundleProcess: ChildProcess | null = null;
 let bundleReady = false;
@@ -414,7 +430,7 @@ function createServer(): McpServer {
           ],
         };
       }
-      const url = `${PUBLIC_URL.replace(/\/+$/, "")}/bundles/upload/${encodeURIComponent(safe)}`;
+      const url = `${uploadBaseUrl().replace(/\/+$/, "")}/bundles/upload/${encodeURIComponent(safe)}`;
       const cmd = `curl -fsS --upload-file ${shellQuote(local_path)} ${shellQuote(url)}`;
       const ttlH = Math.round(UPLOAD_TTL_MS / 3_600_000);
       const maxGb = (MAX_UPLOAD_BYTES / (1024 * 1024 * 1024)).toFixed(1);
@@ -914,12 +930,16 @@ function createServer(): McpServer {
 }
 
 const app = express();
+// Honor X-Forwarded-Proto/Host so requestBaseUrl reflects the URL the client actually used.
+app.set("trust proxy", true);
 
 // Streamable HTTP transport: one McpServer+transport per session.
 const sessions = new Map<string, StreamableHTTPServerTransport>();
 
 app.use("/mcp", express.json());
 app.all("/mcp", async (req: Request, res: Response) => {
+  // Run every MCP HTTP exchange inside a context so prepare_upload can derive the right base URL.
+  await requestContext.run({ baseUrl: requestBaseUrl(req) }, async () => {
   if (req.method === "GET") {
     const sid = req.headers["mcp-session-id"] as string | undefined;
     if (!sid || !sessions.has(sid)) {
@@ -971,6 +991,7 @@ app.all("/mcp", async (req: Request, res: Response) => {
   };
   await createServer().connect(transport);
   await transport.handleRequest(req, res, req.body);
+  });
 });
 
 // Legacy SSE — kept for clients still pointing at /sse. Must not have express.json() in front.
@@ -990,7 +1011,9 @@ app.post("/messages", async (req: Request, res: Response) => {
     res.status(400).json({ error: `Unknown session ID: ${sessionId}` });
     return;
   }
-  await transport.handlePostMessage(req, res);
+  await requestContext.run({ baseUrl: requestBaseUrl(req) }, async () => {
+    await transport.handlePostMessage(req, res);
+  });
 });
 
 // Raw PUT upload — streams straight to disk; never sits behind a body parser.
@@ -1072,7 +1095,11 @@ async function main(): Promise<void> {
   console.log(
     `[MCP] Upload dir: ${UPLOAD_DIR} (max ${(MAX_UPLOAD_BYTES / 1024 / 1024 / 1024).toFixed(1)} GB, TTL ${Math.round(UPLOAD_TTL_MS / 3_600_000)}h)`
   );
-  console.log(`[MCP] Public URL for uploads: ${PUBLIC_URL}`);
+  console.log(
+    PUBLIC_URL_OVERRIDE
+      ? `[MCP] Upload base URL pinned via PUBLIC_URL=${PUBLIC_URL_OVERRIDE}`
+      : `[MCP] Upload base URL: auto-detected from each MCP request's Host header (set PUBLIC_URL to override)`
+  );
   const sweepTimer = setInterval(sweepUploads, UPLOAD_SWEEP_INTERVAL_MS);
   sweepTimer.unref();
 

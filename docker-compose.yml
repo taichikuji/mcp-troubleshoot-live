@@ -13,8 +13,8 @@ services:
       - BUNDLES_DIR=${BUNDLES_DIR:-/bundles}
       # Internal proxy address troubleshoot-live + kubectl share inside the container.
       - PROXY_ADDRESS=${PROXY_ADDRESS:-localhost:8080}
-      # URL the user's MCP client uses to reach this server. Set when MCP and client are on different hosts.
-      - PUBLIC_URL=${PUBLIC_URL:-http://localhost:${HOST_PORT:-3100}}
+      # Override for the upload URL shown by prepare_upload; leave unset to auto-detect from each request's Host header.
+      - PUBLIC_URL=${PUBLIC_URL:-}
       # Upload size cap + idle TTL. Defaults: 5 GB / 6 h. Wiped on restart, deleted on stop_bundle.
       - MAX_UPLOAD_BYTES=${MAX_UPLOAD_BYTES:-5368709120}
       - UPLOAD_TTL_MS=${UPLOAD_TTL_MS:-21600000}

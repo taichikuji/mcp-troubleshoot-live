@@ -56,20 +56,18 @@ docker compose up --build -d
 docker compose logs -f
 ```
 
-If your MCP client (Cursor) and this server run on the **same machine**, the
-default `PUBLIC_URL=http://localhost:3100` is correct and you're done.
+No `PUBLIC_URL` setup is needed in normal cases — the server derives the
+upload base URL per-request from the client's `Host` header (and
+`X-Forwarded-*` if behind a reverse proxy). So Cursor on a Mac talking to an
+MCP container on `192.168.64.12:3100` will get told to upload to
+`http://192.168.64.12:3100/...` automatically; Cursor talking to
+`https://mcp.corp.example.com` (terminated by nginx) will get told to upload
+to that same hostname over HTTPS.
 
-If they run on **different machines** (e.g. Cursor on Mac, MCP in a UTM VM
-or on a remote server), edit `.env`:
+Only set `PUBLIC_URL` in `.env` if auto-detection is wrong (e.g. a CDN that
+rewrites `Host` without setting `X-Forwarded-*`).
 
-```bash
-PUBLIC_URL=http://<vm-or-server-ip>:3100
-```
-
-`PUBLIC_URL` is what the LLM is told to upload bundles to, so it must be
-reachable from the user's machine.
-
-Then point your MCP client at it. For Cursor (`~/.cursor/mcp.json`):
+Point your MCP client at the server. For Cursor (`~/.cursor/mcp.json`):
 
 ```json
 {
@@ -167,7 +165,7 @@ for the full list. The most useful ones:
 | Var | Default | Notes |
 | --- | --- | --- |
 | `HOST_PORT` | `3100` | Host port mapped to the container's internal port 3000. |
-| `PUBLIC_URL` | `http://localhost:${HOST_PORT}` | URL the user's machine uses to reach this MCP. Required if MCP and client are on different hosts — used to render the upload `curl` command. |
+| `PUBLIC_URL` | _(unset; auto-detected per-request)_ | Override for the upload base URL shown by `prepare_upload`. Default behavior derives it from each MCP request's `Host` (with `X-Forwarded-*` honored behind a proxy). Set only if auto-detection is wrong. |
 | `BUNDLE_PATH` | _(unset)_ | If set, auto-loads this bundle on container startup. |
 | `BUNDLES_DIR` | `/bundles` | Directory `list_bundles` scans (mode A). |
 | `UPLOAD_DIR` | `/tmp/troubleshoot-mcp-uploads` | Where uploaded bundles land (mode B). Wiped on container restart. |
