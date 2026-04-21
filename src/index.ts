@@ -26,68 +26,31 @@ const BUNDLES_DIR = process.env.BUNDLES_DIR ?? "/bundles";
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 const PROXY_ADDRESS = process.env.PROXY_ADDRESS ?? "localhost:8080";
 const KUBECTL_TIMEOUT_MS = parseInt(process.env.KUBECTL_TIMEOUT_MS ?? "30000", 10);
-// 5 min default: first bundle load triggers envtest binary download (~185 MB)
-// before the HTTP proxy starts. On slow networks this can exceed 2 minutes.
-const CLUSTER_READY_TIMEOUT_MS = parseInt(
-  process.env.CLUSTER_READY_TIMEOUT_MS ?? "300000",
-  10
-);
+// 5 min: first load downloads ~185 MB of envtest binaries before the proxy starts.
+const CLUSTER_READY_TIMEOUT_MS = parseInt(process.env.CLUSTER_READY_TIMEOUT_MS ?? "300000", 10);
 
-// --- Upload (option B: client-side curl push) ----------------------------
-// Uploads land here, OUTSIDE BUNDLES_DIR, so they never pollute the user's
-// host-mounted bundles folder. Wiped on container start; idle files older
-// than UPLOAD_TTL_MS are reaped on a timer; the file currently loaded is
-// always preserved.
+// Uploads land OUTSIDE BUNDLES_DIR so they never touch the user's host mount.
 const UPLOAD_DIR = process.env.UPLOAD_DIR ?? "/tmp/troubleshoot-mcp-uploads";
-const MAX_UPLOAD_BYTES = parseInt(
-  process.env.MAX_UPLOAD_BYTES ?? String(5 * 1024 * 1024 * 1024), // 5 GB
-  10
-);
-const UPLOAD_TTL_MS = parseInt(
-  process.env.UPLOAD_TTL_MS ?? String(6 * 60 * 60 * 1000), // 6 h
-  10
-);
-const UPLOAD_SWEEP_INTERVAL_MS = parseInt(
-  process.env.UPLOAD_SWEEP_INTERVAL_MS ?? String(30 * 60 * 1000), // 30 min
-  10
-);
-// Public URL the user's machine uses to reach this MCP. Default assumes
-// `docker compose up` on the same host the LLM client runs on. For a remote
-// deployment (e.g. MCP on Ubuntu VM, Cursor on Mac), set PUBLIC_URL to the
-// reachable address — used only to render the curl command in prepare_upload.
+const MAX_UPLOAD_BYTES = parseInt(process.env.MAX_UPLOAD_BYTES ?? String(5 * 1024 * 1024 * 1024), 10);
+const UPLOAD_TTL_MS = parseInt(process.env.UPLOAD_TTL_MS ?? String(6 * 60 * 60 * 1000), 10);
+const UPLOAD_SWEEP_INTERVAL_MS = parseInt(process.env.UPLOAD_SWEEP_INTERVAL_MS ?? String(30 * 60 * 1000), 10);
+// URL the user's machine uses to reach this MCP. Set when MCP and client are on different hosts.
 const PUBLIC_URL = process.env.PUBLIC_URL ?? `http://localhost:${PORT}`;
 
 let bundleProcess: ChildProcess | null = null;
 let bundleReady = false;
 let currentBundlePath: string | null = null;
 
-// Files we created via the upload endpoint. Used so stop_bundle can delete
-// the underlying file (pure /bundles paths are user-owned and never touched).
+// Tracks files we own via the upload endpoint; /bundles paths are never deleted.
 const uploadedPaths = new Set<string>();
 
-// ---------------------------------------------------------------------------
-// kubectl helper
-// ---------------------------------------------------------------------------
-
-// Verbs that do not mutate cluster state. Used to gate `kubectl_run`.
+// Verbs that don't mutate cluster state. Gates kubectl_run.
 const READ_ONLY_VERBS = new Set([
-  "get",
-  "describe",
-  "logs",
-  "top",
-  "explain",
-  "api-resources",
-  "api-versions",
-  "version",
-  "cluster-info",
-  "config",
-  "auth",
-  "events",
-  "wait",
+  "get", "describe", "logs", "top", "explain", "api-resources", "api-versions",
+  "version", "cluster-info", "config", "auth", "events", "wait",
 ]);
 
-// Tokenize a shell-style argument string without invoking a shell. Supports
-// single/double quotes and backslash escapes. Throws on unterminated quotes.
+// Shell-style tokenizer with single/double quotes and backslash escapes; no shell invocation.
 function tokenize(input: string): string[] {
   const tokens: string[] = [];
   let current = "";
@@ -131,11 +94,8 @@ function tokenize(input: string): string[] {
   return tokens;
 }
 
-// troubleshoot-live's HTTP proxy briefly drops the listening socket while it
-// imports CRDs/namespaces/resources right after the apiserver becomes
-// queryable. A kubectl call that lands in that window dies with
-// "connection refused" / "EOF". Retry transient connection errors a few
-// times before giving up; non-transient failures still bubble straight up.
+// troubleshoot-live's proxy briefly drops the listener during bundle import.
+// Retry transient connection errors; everything else fails fast.
 function isTransientKubectlError(stderr: string): boolean {
   return (
     /connection refused/i.test(stderr) ||
@@ -163,7 +123,7 @@ async function runKubectl(args: string[]): Promise<string> {
       lastErr = err as { message: string; stderr?: string };
       const stderr = lastErr.stderr ?? "";
       if (attempt < maxAttempts && isTransientKubectlError(stderr)) {
-        // Exponential backoff: 250ms, 500ms, 1s. Total worst-case 1.75s extra.
+        // Backoff 250ms, 500ms, 1s; worst-case +1.75s.
         await new Promise((r) => setTimeout(r, 250 * 2 ** (attempt - 1)));
         continue;
       }
@@ -177,10 +137,6 @@ function nsArgs(namespace: string | undefined, allNamespacesFallback = true): st
   if (namespace) return ["-n", namespace];
   return allNamespacesFallback ? ["-A"] : [];
 }
-
-// ---------------------------------------------------------------------------
-// troubleshoot-live lifecycle
-// ---------------------------------------------------------------------------
 
 async function waitForCluster(maxWaitMs = CLUSTER_READY_TIMEOUT_MS): Promise<boolean> {
   const deadline = Date.now() + maxWaitMs;
@@ -205,14 +161,7 @@ async function startBundle(bundlePath: string): Promise<void> {
 
     const child = spawn(
       "troubleshoot-live",
-      [
-        "serve",
-        bundlePath,
-        "--output-kubeconfig",
-        KUBECONFIG_PATH,
-        "--proxy-address",
-        PROXY_ADDRESS,
-      ],
+      ["serve", bundlePath, "--output-kubeconfig", KUBECONFIG_PATH, "--proxy-address", PROXY_ADDRESS],
       { stdio: ["ignore", "pipe", "pipe"] }
     );
     bundleProcess = child;
@@ -225,8 +174,7 @@ async function startBundle(bundlePath: string): Promise<void> {
       fn();
     };
 
-    // Buffer combined output so early-exit errors can be reported back to the
-    // LLM rather than vanishing into container logs.
+    // Buffer output so early-exit errors surface to the LLM instead of vanishing into logs.
     const outputLines: string[] = [];
     const MAX_OUTPUT_LINES = 100;
     const captureLine = (prefix: string, d: Buffer) => {
@@ -247,33 +195,27 @@ async function startBundle(bundlePath: string): Promise<void> {
       bundleReady = false;
       bundleProcess = null;
       currentBundlePath = null;
-      // Wipe extraction dir so re-loading the same bundle doesn't hit
-      // "is a directory" on the next attempt. Idempotent (force: true).
+      // Wipe extraction dir so re-loading the same bundle doesn't hit "is a directory".
       try { rmSync("/tmp/troubleshoot-live", { recursive: true, force: true }); } catch {}
       const reason = signal ? `signal ${signal}` : `code ${code}`;
       console.log(`[MCP] troubleshoot-live exited with ${reason}`);
       const output = outputLines.join("\n").trim();
       const detail = output ? `\n\nProcess output:\n${output}` : "";
       settle(() =>
-        reject(
-          new Error(`troubleshoot-live exited before becoming ready (${reason})${detail}`)
-        )
+        reject(new Error(`troubleshoot-live exited before becoming ready (${reason})${detail}`))
       );
     });
 
-    // Give the process a moment to boot before the caller starts polling.
+    // Brief grace period before the caller starts polling.
     setTimeout(() => settle(() => resolve()), 2_000);
   });
 }
 
-// Stop the running bundle and wait for the child to exit. Resolves once the
-// process is gone (or immediately if nothing is running).
+// SIGTERMs the child and waits for exit (or hard-kills after 5s).
 async function stopBundle(timeoutMs = 10_000): Promise<void> {
   const child = bundleProcess;
   if (!child) return;
-  // Capture BEFORE the child exits — startBundle's own exit handler nulls
-  // currentBundlePath synchronously when SIGTERM lands, so reading it inside
-  // finish() would always come back null and maybeDeleteUpload() would no-op.
+  // Capture before exit fires — startBundle's own exit handler nulls currentBundlePath first.
   const wasPath = currentBundlePath;
   console.log("[MCP] Stopping troubleshoot-live…");
 
@@ -285,19 +227,8 @@ async function stopBundle(timeoutMs = 10_000): Promise<void> {
       bundleReady = false;
       bundleProcess = null;
       currentBundlePath = null;
-      try {
-        if (existsSync(KUBECONFIG_PATH)) unlinkSync(KUBECONFIG_PATH);
-      } catch {
-        // best-effort cleanup
-      }
-      // troubleshoot-live extracts bundles to /tmp/troubleshoot-live/ and
-      // leaves them behind on crash. Wipe it so re-loading the same bundle
-      // doesn't hit "is a directory" on the next start attempt.
-      try {
-        rmSync("/tmp/troubleshoot-live", { recursive: true, force: true });
-      } catch {
-        // best-effort cleanup
-      }
+      try { if (existsSync(KUBECONFIG_PATH)) unlinkSync(KUBECONFIG_PATH); } catch {}
+      try { rmSync("/tmp/troubleshoot-live", { recursive: true, force: true }); } catch {}
       maybeDeleteUpload(wasPath);
       resolve();
     };
@@ -313,11 +244,7 @@ async function stopBundle(timeoutMs = 10_000): Promise<void> {
   });
 }
 
-// Resolve a user-supplied bundle reference into an absolute path. Accepts:
-//   - a bare filename ("bundle.tar.gz") — resolved against BUNDLES_DIR
-//   - an absolute path under BUNDLES_DIR ("/bundles/foo.tar.gz")
-//   - an absolute path under UPLOAD_DIR (returned by the upload endpoint)
-// Refuses anything that escapes both roots.
+// Resolve a bundle reference to an absolute path under BUNDLES_DIR or UPLOAD_DIR; rejects escapes.
 function resolveBundlePath(input: string): string {
   const candidate = isAbsolute(input) ? input : join(BUNDLES_DIR, input);
   const abs = resolvePath(candidate);
@@ -331,10 +258,7 @@ function resolveBundlePath(input: string): string {
   return abs;
 }
 
-// --- Upload helpers ------------------------------------------------------
-
-// Restrict to a safe charset and a known archive extension. Strips any path
-// components from the input so callers can't escape UPLOAD_DIR.
+// Strips path components and restricts to safe charset + known archive extension.
 function sanitizeFilename(raw: string): string | null {
   const base = raw.replace(/^.*[\\/]/, "");
   if (!base || base.length > 255) return null;
@@ -345,23 +269,16 @@ function sanitizeFilename(raw: string): string | null {
 }
 
 function shellQuote(s: string): string {
-  // Single-quote wrap; close-quote-escape-quote-reopen for embedded quotes.
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
-// Wipe and recreate UPLOAD_DIR. Called once at startup so a previous crash
-// can't leave orphan files lying around the container's tmpfs.
+// Wipe + recreate UPLOAD_DIR at startup so a previous crash can't leave orphans.
 function initUploadDir(): void {
-  try {
-    rmSync(UPLOAD_DIR, { recursive: true, force: true });
-  } catch {
-    // best-effort
-  }
+  try { rmSync(UPLOAD_DIR, { recursive: true, force: true }); } catch {}
   mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
-// Periodic reaper: delete idle upload files older than UPLOAD_TTL_MS.
-// Never deletes the file currently loaded in troubleshoot-live.
+// Reaps idle uploads older than UPLOAD_TTL_MS. Skips the currently loaded file.
 function sweepUploads(): void {
   if (!existsSync(UPLOAD_DIR)) return;
   const now = Date.now();
@@ -376,22 +293,17 @@ function sweepUploads(): void {
         uploadedPaths.delete(full);
         console.log(`[MCP] Reaped idle upload: ${full}`);
       }
-    } catch {
-      // file may have vanished mid-loop; ignore
-    }
+    } catch {}
   }
 }
 
-// Delete an upload file IFF we own it. Pure /bundles paths are skipped so
-// we never touch user-owned host-mounted files.
+// Deletes an upload file iff we own it; /bundles paths are user-owned and skipped.
 function maybeDeleteUpload(p: string | null): void {
   if (!p || !uploadedPaths.has(p)) return;
   try {
     unlinkSync(p);
     console.log(`[MCP] Deleted uploaded bundle after stop: ${p}`);
-  } catch {
-    // already gone
-  }
+  } catch {}
   uploadedPaths.delete(p);
 }
 
@@ -410,12 +322,7 @@ function listBundleFiles(): { path: string; name: string; sizeBytes: number; mod
       if (s.isDirectory()) {
         walk(full);
       } else if (s.isFile() && /\.(tar\.gz|tgz|tar)$/i.test(entry)) {
-        out.push({
-          path: full,
-          name: entry,
-          sizeBytes: s.size,
-          modified: s.mtime.toISOString(),
-        });
+        out.push({ path: full, name: entry, sizeBytes: s.size, modified: s.mtime.toISOString() });
       }
     }
   };
@@ -423,17 +330,12 @@ function listBundleFiles(): { path: string; name: string; sizeBytes: number; mod
   return out.sort((a, b) => b.modified.localeCompare(a.modified));
 }
 
-// ---------------------------------------------------------------------------
-// MCP server factory
-// ---------------------------------------------------------------------------
-// A fresh McpServer is created per transport session (/mcp and /sse) so
-// concurrent clients each get their own instance. All tool handlers close
-// over the shared module-level state (bundleProcess, bundleReady).
-
-const requireReady = (): { content: [{ type: "text"; text: string }] } | null =>
+// Fresh McpServer per session; tool handlers close over the shared module-level state.
+const requireReady = (): { content: [{ type: "text"; text: string }]; isError: true } | null =>
   bundleReady
     ? null
     : {
+        isError: true,
         content: [
           {
             type: "text",
@@ -444,10 +346,7 @@ const requireReady = (): { content: [{ type: "text"; text: string }] } | null =>
 
 function createServer(): McpServer {
   const server = new McpServer(
-    {
-      name: "troubleshoot-live-mcp",
-      version: "1.0.0",
-    },
+    { name: "troubleshoot-live-mcp", version: "1.0.0" },
     {
       instructions: [
         "Tools for inspecting Kubernetes support bundles via troubleshoot-live.",
@@ -470,8 +369,6 @@ function createServer(): McpServer {
     }
   );
 
-  // --- Bundle lifecycle ---
-
   server.registerTool(
     "prepare_upload",
     {
@@ -484,11 +381,7 @@ function createServer(): McpServer {
             "Absolute path to the support bundle on the user's local machine (e.g. /Users/alice/Downloads/foo.tar.gz)."
           ),
       },
-      annotations: {
-        readOnlyHint: true,
-        destructiveHint: false,
-        idempotentHint: true,
-      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     },
     async ({ local_path }) => {
       const base = local_path.replace(/^.*[\\/]/, "");
@@ -549,7 +442,7 @@ function createServer(): McpServer {
         resolved = resolveBundlePath(bundle_path);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        return { content: [{ type: "text", text: msg }] };
+        return { isError: true, content: [{ type: "text", text: msg }] };
       }
       if (!existsSync(resolved)) {
         return {
@@ -592,6 +485,7 @@ function createServer(): McpServer {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return {
+          isError: true,
           content: [{ type: "text", text: `Failed to start troubleshoot-live: ${msg}` }],
         };
       }
@@ -625,10 +519,7 @@ function createServer(): McpServer {
       await stopBundle();
       return {
         content: [
-          {
-            type: "text",
-            text: `Unloaded bundle '${wasLoaded}'. Use start_bundle to load another.`,
-          },
+          { type: "text", text: `Unloaded bundle '${wasLoaded}'. Use start_bundle to load another.` },
         ],
       };
     }
@@ -707,8 +598,6 @@ function createServer(): McpServer {
     }
   );
 
-  // --- Namespace & node overview ---
-
   server.registerTool(
     "list_namespaces",
     { description: "List all namespaces in the support bundle cluster." },
@@ -727,8 +616,6 @@ function createServer(): McpServer {
       }
   );
 
-  // --- Workloads ---
-
   server.registerTool(
     "get_pods",
     {
@@ -743,10 +630,7 @@ function createServer(): McpServer {
     async ({ namespace }) =>
       requireReady() ?? {
         content: [
-          {
-            type: "text",
-            text: await runKubectl(["get", "pods", ...nsArgs(namespace), "-o", "wide"]),
-          },
+          { type: "text", text: await runKubectl(["get", "pods", ...nsArgs(namespace), "-o", "wide"]) },
         ],
       }
   );
@@ -762,10 +646,7 @@ function createServer(): McpServer {
     async ({ namespace }) =>
       requireReady() ?? {
         content: [
-          {
-            type: "text",
-            text: await runKubectl(["get", "deployments", ...nsArgs(namespace), "-o", "wide"]),
-          },
+          { type: "text", text: await runKubectl(["get", "deployments", ...nsArgs(namespace), "-o", "wide"]) },
         ],
       }
   );
@@ -781,15 +662,10 @@ function createServer(): McpServer {
     async ({ namespace }) =>
       requireReady() ?? {
         content: [
-          {
-            type: "text",
-            text: await runKubectl(["get", "services", ...nsArgs(namespace), "-o", "wide"]),
-          },
+          { type: "text", text: await runKubectl(["get", "services", ...nsArgs(namespace), "-o", "wide"]) },
         ],
       }
   );
-
-  // --- Logs ---
 
   server.registerTool(
     "get_pod_logs",
@@ -834,8 +710,6 @@ function createServer(): McpServer {
     }
   );
 
-  // --- Events ---
-
   server.registerTool(
     "get_events",
     {
@@ -860,8 +734,6 @@ function createServer(): McpServer {
     }
   );
 
-  // --- Generic describe / get ---
-
   server.registerTool(
     "describe_resource",
     {
@@ -885,10 +757,7 @@ function createServer(): McpServer {
       if (ready) return ready;
       return {
         content: [
-          {
-            type: "text",
-            text: await runKubectl(["describe", kind, name, ...nsArgs(namespace, false)]),
-          },
+          { type: "text", text: await runKubectl(["describe", kind, name, ...nsArgs(namespace, false)]) },
         ],
       };
     }
@@ -951,14 +820,15 @@ function createServer(): McpServer {
         tokens = tokenize(args);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        return { content: [{ type: "text", text: `Error parsing args: ${msg}` }] };
+        return { isError: true, content: [{ type: "text", text: `Error parsing args: ${msg}` }] };
       }
       if (tokens.length === 0) {
-        return { content: [{ type: "text", text: "Error: no kubectl command provided" }] };
+        return { isError: true, content: [{ type: "text", text: "Error: no kubectl command provided" }] };
       }
       const verb = tokens[0]!.toLowerCase();
       if (!READ_ONLY_VERBS.has(verb)) {
         return {
+          isError: true,
           content: [
             {
               type: "text",
@@ -978,13 +848,9 @@ function createServer(): McpServer {
   return server;
 }
 
-// ---------------------------------------------------------------------------
-// HTTP transport
-// ---------------------------------------------------------------------------
-
 const app = express();
 
-// Streamable HTTP (current standard) — one McpServer+transport per session.
+// Streamable HTTP transport: one McpServer+transport per session.
 const sessions = new Map<string, StreamableHTTPServerTransport>();
 
 app.use("/mcp", express.json());
@@ -1014,23 +880,18 @@ app.all("/mcp", async (req: Request, res: Response) => {
     return;
   }
 
-  // POST — route to existing session or initialise a new one.
   const sid = req.headers["mcp-session-id"] as string | undefined;
   if (sid && sessions.has(sid)) {
     await sessions.get(sid)!.handleRequest(req, res, req.body);
     return;
   }
 
-  // Unknown session ID: the session has expired or the ID is invalid.
-  // Return 404 so spec-compliant clients can detect the stale session and
-  // recover via re-initialization (sending a fresh initialize request without
-  // a session ID).
+  // Unknown sid: 404 so spec-compliant clients re-initialize cleanly.
   if (sid) {
     res.status(404).json({ error: "Session not found" });
     return;
   }
 
-  // No session ID — only allow new sessions for initialize requests.
   if (!isInitializeRequest(req.body)) {
     res.status(400).json({ error: "Bad Request: missing or unknown mcp-session-id" });
     return;
@@ -1047,9 +908,7 @@ app.all("/mcp", async (req: Request, res: Response) => {
   await transport.handleRequest(req, res, req.body);
 });
 
-// Legacy SSE transport — kept for backwards compatibility with Cursor's
-// current mcp.json which points to /sse. SSEServerTransport reads the raw
-// request body itself, so express.json() must NOT run before /messages.
+// Legacy SSE — kept for clients still pointing at /sse. Must not have express.json() in front.
 const sseTransports = new Map<string, SSEServerTransport>();
 
 app.get("/sse", async (_req: Request, res: Response) => {
@@ -1069,10 +928,7 @@ app.post("/messages", async (req: Request, res: Response) => {
   await transport.handlePostMessage(req, res);
 });
 
-// Bundle upload endpoint. PUT a raw .tar.gz body and we stream it straight to
-// disk in UPLOAD_DIR with a uuid prefix so concurrent uploads can't collide.
-// Intentionally NOT mounted under any body parser — we need the request stream
-// untouched. Aborts cleanly on size overflow.
+// Raw PUT upload — streams straight to disk; never sits behind a body parser.
 app.put("/bundles/upload/:name", (req: Request, res: Response) => {
   const safe = sanitizeFilename(req.params.name ?? "");
   if (!safe) {
@@ -1120,11 +976,7 @@ app.put("/bundles/upload/:name", (req: Request, res: Response) => {
     if (aborted) return;
     uploadedPaths.add(dest);
     console.log(`[MCP] Received upload: ${dest} (${bytes} bytes)`);
-    res.status(201).json({
-      path: dest,
-      name: `${id}-${safe}`,
-      sizeBytes: bytes,
-    });
+    res.status(201).json({ path: dest, name: `${id}-${safe}`, sizeBytes: bytes });
   });
 
   req.pipe(ws);
@@ -1142,18 +994,10 @@ app.get("/health", (_req: Request, res: Response) => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Bootstrap
-// ---------------------------------------------------------------------------
-
 async function main(): Promise<void> {
   initUploadDir();
-  // Wipe any leftover troubleshoot-live extraction dirs from a previous crash.
-  try {
-    rmSync("/tmp/troubleshoot-live", { recursive: true, force: true });
-  } catch {
-    // best-effort
-  }
+  // Wipe leftover extraction dirs from a previous crash.
+  try { rmSync("/tmp/troubleshoot-live", { recursive: true, force: true }); } catch {}
   console.log(
     `[MCP] Upload dir: ${UPLOAD_DIR} (max ${(MAX_UPLOAD_BYTES / 1024 / 1024 / 1024).toFixed(1)} GB, TTL ${Math.round(UPLOAD_TTL_MS / 3_600_000)}h)`
   );
@@ -1163,12 +1007,8 @@ async function main(): Promise<void> {
 
   if (BUNDLE_PATH) {
     if (!existsSync(BUNDLE_PATH)) {
-      console.warn(
-        `[MCP] BUNDLE_PATH is set to "${BUNDLE_PATH}" but the file was not found.`
-      );
-      console.warn(
-        "[MCP] Starting MCP server anyway — use the start_bundle tool to load a bundle."
-      );
+      console.warn(`[MCP] BUNDLE_PATH is set to "${BUNDLE_PATH}" but the file was not found.`);
+      console.warn("[MCP] Starting MCP server anyway — use the start_bundle tool to load a bundle.");
     } else {
       try {
         await startBundle(BUNDLE_PATH);

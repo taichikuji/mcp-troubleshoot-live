@@ -5,37 +5,23 @@ services:
     restart: unless-stopped
     container_name: troubleshoot-mcp
     ports:
-      # HOST_PORT is the port exposed on your machine. The app always binds
-      # to 3000 inside the container. Change HOST_PORT if 3100 conflicts.
+      # App always binds 3000 inside; HOST_PORT is the host-side port.
       - "${HOST_PORT:-3100}:3000"
     environment:
-      # Optional: bundle to auto-load on startup. If unset, the AI picks one
-      # at runtime via the list_bundles + start_bundle tools (and can switch
-      # between bundles mid-conversation without restarting the container).
+      # Auto-load on startup; unset = AI picks one via list_bundles/start_bundle.
       - BUNDLE_PATH=${BUNDLE_PATH:-}
       - BUNDLES_DIR=${BUNDLES_DIR:-/bundles}
-      # Internal address troubleshoot-live binds to inside the container.
-      # kubectl (also inside the container) connects here. Do not change unless
-      # port 8080 conflicts with another process running in the same container.
+      # Internal proxy address troubleshoot-live + kubectl share inside the container.
       - PROXY_ADDRESS=${PROXY_ADDRESS:-localhost:8080}
-      # Public URL the user's MCP client (e.g. Cursor on a Mac) uses to reach
-      # this server. Used by the prepare_upload tool to render a curl command
-      # the LLM tells the user (or runs via shell) to push a local bundle.
-      # Set this whenever the MCP is NOT on the same host as the LLM client.
-      # Examples: http://192.168.64.10:3100, http://my-vm.local:3100
+      # URL the user's MCP client uses to reach this server. Set when MCP and client are on different hosts.
       - PUBLIC_URL=${PUBLIC_URL:-http://localhost:${HOST_PORT:-3100}}
-      # Upload limits + cleanup. Uploads land in /tmp inside the container,
-      # are wiped on container restart, deleted on stop_bundle, and reaped
-      # after UPLOAD_TTL_MS of inactivity. Defaults are 5 GB / 6 h.
+      # Upload size cap + idle TTL. Defaults: 5 GB / 6 h. Wiped on restart, deleted on stop_bundle.
       - MAX_UPLOAD_BYTES=${MAX_UPLOAD_BYTES:-5368709120}
       - UPLOAD_TTL_MS=${UPLOAD_TTL_MS:-21600000}
     volumes:
       # Optional: drop .tar.gz bundles here for direct loading without upload.
-      # Uploaded bundles live in the container's /tmp and never touch this dir.
       - ./bundles:/bundles
-      # Cache the envtest binaries (kube-apiserver + etcd) across restarts.
-      # Mounted at the default setup-envtest store location so troubleshoot-live
-      # can find binaries it downloaded without needing KUBEBUILDER_ASSETS set.
+      # Cache envtest binaries (kube-apiserver + etcd) at the default setup-envtest path.
       - envtest-cache:/home/node/.local/share/kubebuilder-envtest
 
 volumes:

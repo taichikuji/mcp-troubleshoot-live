@@ -1,13 +1,9 @@
 # syntax=docker/dockerfile:1
 
-# ---------------------------------------------------------------------------
 # Stage 1: download external CLI tools (kubectl, troubleshoot-live).
-# Build-only deps (curl, tar, apt cache) live here and never reach runtime.
-# ---------------------------------------------------------------------------
 FROM debian:bookworm-slim AS tools
 
-# Fail-fast shell: errexit + pipefail so failures inside pipes (e.g. the
-# `curl ... | tar -xz` below) abort the build instead of being swallowed.
+# errexit + pipefail so failures inside `curl ... | tar -xz` abort the build.
 SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 
 ARG KUBECTL_VERSION=v1.29.4
@@ -31,17 +27,13 @@ RUN ARCH=$(dpkg --print-architecture) && \
       | tar -xz -C /usr/local/bin troubleshoot-live && \
     chmod +x /usr/local/bin/troubleshoot-live
 
-# ---------------------------------------------------------------------------
-# Stage 2: compile TypeScript and prune dev dependencies.
-# Independent of the `tools` stage so BuildKit can run them in parallel.
-# ---------------------------------------------------------------------------
+# Stage 2: compile TypeScript and prune dev deps. Independent of `tools` for parallelism.
 FROM node:22-bookworm-slim AS builder
 
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-# Cache mount: npm registry tarballs survive across builds, so re-runs without
-# package-lock.json changes are essentially free.
+# Cache mount: npm registry tarballs survive across builds.
 RUN --mount=type=cache,target=/root/.npm npm ci
 
 COPY tsconfig.json ./
@@ -49,18 +41,12 @@ COPY src/ ./src/
 RUN npm run build && \
     npm prune --omit=dev
 
-# ---------------------------------------------------------------------------
 # Stage 3: minimal runtime image.
-# No apt-get, no curl, no tar -- only the artifacts we actually need.
-# ---------------------------------------------------------------------------
 FROM node:22-bookworm-slim AS runtime
 
 WORKDIR /app
 
-# troubleshoot-live (Go binary) and kubectl validate TLS against the system
-# CA store at /etc/ssl/certs/ca-certificates.crt. The slim base image strips
-# it; first envtest binary fetch from raw.githubusercontent.com fails with
-# x509: certificate signed by unknown authority without this.
+# troubleshoot-live (Go) reads /etc/ssl/certs/ca-certificates.crt; slim base strips it.
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
@@ -68,14 +54,12 @@ RUN apt-get update -y && \
 COPY --from=tools /usr/local/bin/kubectl          /usr/local/bin/kubectl
 COPY --from=tools /usr/local/bin/troubleshoot-live /usr/local/bin/troubleshoot-live
 
-# --chown at COPY time avoids a separate `chown -R` layer that would duplicate
-# every node_modules file and inflate the final image.
+# --chown at COPY avoids a separate `chown -R` layer that duplicates node_modules.
 COPY --chown=node:node --from=builder /app/node_modules ./node_modules
 COPY --chown=node:node --from=builder /app/dist          ./dist
 COPY --chown=node:node package.json ./
 
-# /bundles is bind-mounted from the host at runtime; we just need the
-# mountpoint to exist so the container starts cleanly when no mount is given.
+# Mountpoint must exist so the container starts cleanly when no host mount is given.
 RUN mkdir -p /bundles && chown node:node /bundles
 
 USER node
