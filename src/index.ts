@@ -131,21 +131,46 @@ function tokenize(input: string): string[] {
   return tokens;
 }
 
+// troubleshoot-live's HTTP proxy briefly drops the listening socket while it
+// imports CRDs/namespaces/resources right after the apiserver becomes
+// queryable. A kubectl call that lands in that window dies with
+// "connection refused" / "EOF". Retry transient connection errors a few
+// times before giving up; non-transient failures still bubble straight up.
+function isTransientKubectlError(stderr: string): boolean {
+  return (
+    /connection refused/i.test(stderr) ||
+    /EOF/.test(stderr) ||
+    /Unable to connect to the server/i.test(stderr) ||
+    /no route to host/i.test(stderr)
+  );
+}
+
 async function runKubectl(args: string[]): Promise<string> {
   if (!existsSync(KUBECONFIG_PATH)) {
     return "No kubeconfig found. Start a bundle first with the start_bundle tool.";
   }
-  try {
-    const { stdout, stderr } = await execFileAsync(
-      "kubectl",
-      [`--kubeconfig=${KUBECONFIG_PATH}`, ...args],
-      { timeout: KUBECTL_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 }
-    );
-    return (stdout || stderr).trim();
-  } catch (err: unknown) {
-    const e = err as { message: string; stderr?: string };
-    return `Error: ${e.message}\n${e.stderr ?? ""}`.trim();
+  const maxAttempts = 4;
+  let lastErr: { message: string; stderr?: string } = { message: "" };
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const { stdout, stderr } = await execFileAsync(
+        "kubectl",
+        [`--kubeconfig=${KUBECONFIG_PATH}`, ...args],
+        { timeout: KUBECTL_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 }
+      );
+      return (stdout || stderr).trim();
+    } catch (err: unknown) {
+      lastErr = err as { message: string; stderr?: string };
+      const stderr = lastErr.stderr ?? "";
+      if (attempt < maxAttempts && isTransientKubectlError(stderr)) {
+        // Exponential backoff: 250ms, 500ms, 1s. Total worst-case 1.75s extra.
+        await new Promise((r) => setTimeout(r, 250 * 2 ** (attempt - 1)));
+        continue;
+      }
+      break;
+    }
   }
+  return `Error: ${lastErr.message}\n${lastErr.stderr ?? ""}`.trim();
 }
 
 function nsArgs(namespace: string | undefined, allNamespacesFallback = true): string[] {
