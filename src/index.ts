@@ -200,22 +200,39 @@ async function startBundle(bundlePath: string): Promise<void> {
       fn();
     };
 
-    child.stdout?.on("data", (d: Buffer) =>
-      process.stdout.write(`[troubleshoot-live] ${d}`)
-    );
-    child.stderr?.on("data", (d: Buffer) =>
-      process.stderr.write(`[troubleshoot-live] ${d}`)
-    );
+    // Buffer combined output so early-exit errors can be reported back to the
+    // LLM rather than vanishing into container logs.
+    const outputLines: string[] = [];
+    const MAX_OUTPUT_LINES = 100;
+    const captureLine = (prefix: string, d: Buffer) => {
+      process.stdout.write(`[troubleshoot-live] ${d}`);
+      for (const line of d.toString().split("\n")) {
+        const content = line.trimEnd();
+        if (content.length === 0) continue;
+        outputLines.push(`${prefix}: ${content}`);
+        if (outputLines.length > MAX_OUTPUT_LINES) outputLines.shift();
+      }
+    };
+
+    child.stdout?.on("data", (d: Buffer) => captureLine("stdout", d));
+    child.stderr?.on("data", (d: Buffer) => captureLine("stderr", d));
 
     child.on("error", (err) => settle(() => reject(err)));
     child.on("exit", (code, signal) => {
       bundleReady = false;
       bundleProcess = null;
       currentBundlePath = null;
+      // Wipe extraction dir so re-loading the same bundle doesn't hit
+      // "is a directory" on the next attempt. Idempotent (force: true).
+      try { rmSync("/tmp/troubleshoot-live", { recursive: true, force: true }); } catch {}
       const reason = signal ? `signal ${signal}` : `code ${code}`;
       console.log(`[MCP] troubleshoot-live exited with ${reason}`);
+      const output = outputLines.join("\n").trim();
+      const detail = output ? `\n\nProcess output:\n${output}` : "";
       settle(() =>
-        reject(new Error(`troubleshoot-live exited before becoming ready (${reason})`))
+        reject(
+          new Error(`troubleshoot-live exited before becoming ready (${reason})${detail}`)
+        )
       );
     });
 
@@ -242,6 +259,14 @@ async function stopBundle(timeoutMs = 10_000): Promise<void> {
       currentBundlePath = null;
       try {
         if (existsSync(KUBECONFIG_PATH)) unlinkSync(KUBECONFIG_PATH);
+      } catch {
+        // best-effort cleanup
+      }
+      // troubleshoot-live extracts bundles to /tmp/troubleshoot-live/ and
+      // leaves them behind on crash. Wipe it so re-loading the same bundle
+      // doesn't hit "is a directory" on the next start attempt.
+      try {
+        rmSync("/tmp/troubleshoot-live", { recursive: true, force: true });
       } catch {
         // best-effort cleanup
       }
@@ -1095,6 +1120,12 @@ app.get("/health", (_req: Request, res: Response) => {
 
 async function main(): Promise<void> {
   initUploadDir();
+  // Wipe any leftover troubleshoot-live extraction dirs from a previous crash.
+  try {
+    rmSync("/tmp/troubleshoot-live", { recursive: true, force: true });
+  } catch {
+    // best-effort
+  }
   console.log(
     `[MCP] Upload dir: ${UPLOAD_DIR} (max ${(MAX_UPLOAD_BYTES / 1024 / 1024 / 1024).toFixed(1)} GB, TTL ${Math.round(UPLOAD_TTL_MS / 3_600_000)}h)`
   );
