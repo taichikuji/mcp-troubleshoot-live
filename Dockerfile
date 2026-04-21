@@ -57,6 +57,14 @@ FROM node:22-bookworm-slim AS runtime
 
 WORKDIR /app
 
+# troubleshoot-live (Go binary) and kubectl validate TLS against the system
+# CA store at /etc/ssl/certs/ca-certificates.crt. The slim base image strips
+# it; first envtest binary fetch from raw.githubusercontent.com fails with
+# x509: certificate signed by unknown authority without this.
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY --from=tools /usr/local/bin/kubectl          /usr/local/bin/kubectl
 COPY --from=tools /usr/local/bin/troubleshoot-live /usr/local/bin/troubleshoot-live
 

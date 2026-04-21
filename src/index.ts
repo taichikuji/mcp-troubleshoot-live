@@ -246,6 +246,10 @@ async function startBundle(bundlePath: string): Promise<void> {
 async function stopBundle(timeoutMs = 10_000): Promise<void> {
   const child = bundleProcess;
   if (!child) return;
+  // Capture BEFORE the child exits — startBundle's own exit handler nulls
+  // currentBundlePath synchronously when SIGTERM lands, so reading it inside
+  // finish() would always come back null and maybeDeleteUpload() would no-op.
+  const wasPath = currentBundlePath;
   console.log("[MCP] Stopping troubleshoot-live…");
 
   return new Promise((resolve) => {
@@ -253,7 +257,6 @@ async function stopBundle(timeoutMs = 10_000): Promise<void> {
     const finish = () => {
       if (done) return;
       done = true;
-      const wasPath = currentBundlePath;
       bundleReady = false;
       bundleProcess = null;
       currentBundlePath = null;
