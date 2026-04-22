@@ -326,7 +326,15 @@ export function createServer(): McpServer {
         ]),
       ]);
       const cap = warning_event_limit ?? 50;
-      const trimmedWarn = warnEvents.split("\n").slice(-cap - 1).join("\n");
+      // kubectl prints a single header row first; preserve it and keep only
+      // the last `cap` data rows. Slicing the whole array from the end (as
+      // the previous version did) drops the header whenever rows > cap.
+      const warnLines = warnEvents.split("\n");
+      const [warnHeader, ...warnRows] = warnLines;
+      const trimmedWarn =
+        warnRows.length <= cap
+          ? warnEvents
+          : [warnHeader, ...warnRows.slice(-cap)].join("\n");
       return textResult([
         "=== NODES ===",
         nodes,
