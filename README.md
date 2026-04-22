@@ -26,9 +26,9 @@ have laid out; mode B works regardless of where the MCP runs.
 
 ## Features
 
-- 15 typed MCP tools for upload, bundle lifecycle, namespaces, nodes,
-  workloads, logs, events, and generic `describe` / `get` / read-only
-  `kubectl_run`.
+- 16 typed MCP tools for upload, bundle lifecycle, namespaces, nodes,
+  workloads, logs, events, batched cluster overview, and generic
+  `describe` / `get` / read-only `kubectl_run`.
 - `prepare_upload` tool — emits a `curl` command the LLM runs from the
   user's shell to push a local bundle to the server. No `scp`, no manual
   file moves.
@@ -98,9 +98,11 @@ What happens:
    Cold loads take 1–3 minutes (envtest binary download); warm loads ~5–30s.
    This polling pattern keeps the LLM client from hitting its tool-call
    timeout (Cursor/Claude default ~60s).
-6. Once ready, LLM uses `get_pods`, `get_events`, `get_pod_logs`,
-   `describe_resource`, `kubectl_run`, etc. to triage. Inspection tools called
-   while a load is still in progress refuse with a "still loading" hint.
+6. Once ready, the LLM typically calls `cluster_overview` first for a batched
+   triage pass (nodes + namespaces + not-ready pods + Warning events in one
+   round-trip), then drills in with `get_pod_logs`, `describe_resource`,
+   `kubectl_run`, etc. Inspection tools called while a load is still in
+   progress refuse with a "still loading" hint.
 7. When done, `stop_bundle` shuts the cluster down and deletes the uploaded
    file. The MCP server itself stays up for the next bundle.
 
@@ -176,6 +178,9 @@ for the full list. The most useful ones:
 | `KUBECONFIG_PATH` | `/tmp/kubeconfig` | Where the kubeconfig is written. |
 | `KUBECTL_TIMEOUT_MS` | `30000` | Per-call kubectl timeout. |
 | `CLUSTER_READY_TIMEOUT_MS` | `300000` | Bundle readiness timeout. |
+| `KUBECTL_CACHE_TTL_MS` | `300000` (5 min) | Per-bundle cache TTL for `kubectl` results. The loaded bundle is immutable, so identical queries within the TTL are served from memory. The cache is cleared automatically on `start_bundle` / `stop_bundle`. Set to `0` to disable. |
+| `KUBECTL_CACHE_MAX_ENTRIES` | `256` | FIFO eviction cap on the cache. |
+| `RESPONSE_SOFT_LIMIT_BYTES` | `204800` (200 KB) | Threshold above which tool responses get a non-truncating "narrow your query" hint appended. The full payload is still returned. |
 
 Build-time:
 
@@ -193,6 +198,7 @@ Build-time:
 | `start_bundle` | Load a bundle by filename in `/bundles`, absolute path under `/bundles`, or path/name returned by `prepare_upload`. Returns immediately with `status=loading` or `status=ready` — poll `cluster_status` until ready. Switching unloads the previous bundle automatically. |
 | `stop_bundle` | Unload the current bundle, shut down the in-memory cluster, and delete the file IF it was uploaded. |
 | `cluster_status` | Reports one of `idle` / `loading` / `ready` / `failed` (with crash detail). Use to poll after `start_bundle` and to confirm the cluster is responsive. On `ready` also returns the namespace list. |
+| `cluster_overview` | Batched triage tool. One call returns nodes, namespaces, not-ready pods across all namespaces, and recent Warning events. Underlying kubectls run in parallel and all four results are cached. Prefer this over running `get_nodes` + `list_namespaces` + `get_pods` + `get_events` separately. Optional `warning_event_limit` (default 50, max 500) caps the warning tail. |
 | `list_namespaces` | `kubectl get namespaces -o wide`. |
 | `get_nodes` | `kubectl get nodes -o wide`. |
 | `get_pods` | List pods, optionally scoped to a namespace. |
@@ -279,6 +285,25 @@ explicit in chat:
 > `logs` style verbs. Do not attempt to apply, delete, edit, patch, exec,
 > cp, drain, or scale anything. Do NOT run kubectl on my local machine —
 > always go through the troubleshoot-live MCP.
+
+## Performance
+
+- **Response cache**: `kubectl` results are cached per-bundle for 5 minutes
+  (`KUBECTL_CACHE_TTL_MS`). The loaded bundle is an immutable envtest replay,
+  so repeated identical queries inside a session are served from memory. The
+  cache is cleared automatically when `start_bundle` switches bundles or
+  `stop_bundle` unloads. Set `KUBECTL_CACHE_TTL_MS=0` to disable.
+- **Batched triage**: `cluster_overview` collapses 3–4 separate calls into
+  one and runs the underlying `kubectl` invocations in parallel
+  (`Promise.all`).
+- **Soft response limit**: payloads above `RESPONSE_SOFT_LIMIT_BYTES`
+  (default 200 KB) are returned in full, with a "narrow your query" hint
+  appended so the LLM knows to scope future calls with `-n`, `--selector`,
+  `--field-selector`, or a single resource name.
+- **Stderr-only logging**: all server diagnostics (including forwarded
+  `troubleshoot-live` output) go to stderr. Stdout is reserved for any
+  future STDIO-transport mode where MCP frames must not be interleaved with
+  log noise.
 
 ## Local development
 
