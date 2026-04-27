@@ -1,9 +1,6 @@
 import { KUBECTL_CACHE_MAX_ENTRIES, KUBECTL_CACHE_TTL_MS } from "./config.js";
 
-// Tiny FIFO TTL cache. Keyed by serialized argv, scoped to one bundle load
-// (cleared on start_bundle / stop_bundle). FIFO eviction is good enough at
-// this size; LRU buys ~nothing on a 256-entry table.
-
+// FIFO TTL cache keyed by argv. Cleared on bundle switch. LRU buys nothing at 256 entries.
 type CacheEntry = { value: string; expiresAt: number };
 
 const cache = new Map<string, CacheEntry>();
@@ -25,8 +22,7 @@ export function cacheGet(args: string[]): string | null {
 export function cacheSet(args: string[], value: string): void {
   if (KUBECTL_CACHE_TTL_MS <= 0) return;
   if (cache.size >= KUBECTL_CACHE_MAX_ENTRIES) {
-    // Map iteration is insertion order, so .keys().next() is the oldest.
-    const oldest = cache.keys().next().value;
+    const oldest = cache.keys().next().value; // Map iterates insertion order
     if (oldest !== undefined) cache.delete(oldest);
   }
   cache.set(cacheKey(args), {

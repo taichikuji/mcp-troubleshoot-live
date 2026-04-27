@@ -31,9 +31,7 @@ import { mountMcpRoutes } from "./transport.js";
 import { handleUpload, initUploadDir, sweepUploads } from "./uploads.js";
 
 const app = express();
-// Honor X-Forwarded-Proto/Host so requestBaseUrl reflects the URL the client
-// actually used.
-app.set("trust proxy", true);
+app.set("trust proxy", true); // Honor X-Forwarded-Proto/Host
 
 mountMcpRoutes(app);
 
@@ -55,7 +53,6 @@ app.get("/health", (_req: Request, res: Response) => {
 
 async function main(): Promise<void> {
   initUploadDir();
-  // Wipe leftover extraction dirs from a previous crash.
   try { rmSync(TROUBLESHOOT_LIVE_WORKDIR, { recursive: true, force: true }); } catch {}
 
   log(

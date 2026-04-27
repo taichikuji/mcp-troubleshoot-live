@@ -67,16 +67,12 @@ const INSTRUCTIONS = [
   "owns the live cluster.",
 ].join("\n");
 
-// Wrap any handler so:
-//   1. Unexpected throws become well-formed error results (safeRun).
-//   2. If the cluster isn't ready, the tool short-circuits with the
-//      standard "not ready" message instead of running its body.
+// Cluster-ready guard + error boundary for tool handlers.
 async function readyTool(name: string, fn: () => Promise<ToolResult>): Promise<ToolResult> {
   return safeRun(name, async () => requireReady() ?? (await fn()));
 }
 
-// Helper for the common "kubectl with optional namespace" tool shape. Eliminates
-// ~80 lines of boilerplate across 8 tools.
+// Registers a kubectl tool with an optional namespace param, cutting boilerplate.
 type KubectlToolOpts<S extends ZodRawShape> = {
   description: string;
   inputSchema?: S;
@@ -93,9 +89,7 @@ function registerKubectlTool<S extends ZodRawShape>(
       description: opts.description,
       ...(opts.inputSchema ? { inputSchema: opts.inputSchema } : {}),
     },
-    // SDK's generic over inputSchema is not exported in a way we can thread
-    // through cleanly, so we cast at the boundary; runtime validation is still
-    // done by Zod.
+    // Cast needed: SDK doesn't export the generic cleanly; Zod still validates at runtime.
     (async (params: z.infer<z.ZodObject<S>>) =>
       readyTool(name, async () => textResult(await runKubectl(opts.buildArgs(params))))) as never,
   );
@@ -206,8 +200,7 @@ export function createServer(): McpServer {
         return errorResult(`Failed to start troubleshoot-live: ${msg}`);
       }
 
-      // Background readiness watch; lets us return immediately so the LLM
-      // client doesn't hit its tool-call timeout.
+      // Watch in background so we return immediately and avoid tool-call timeouts.
       const startedFor = resolved;
       void (async () => {
         log("[MCP] Waiting for Kubernetes API to become ready…");
@@ -326,9 +319,7 @@ export function createServer(): McpServer {
         ]),
       ]);
       const cap = warning_event_limit ?? 50;
-      // kubectl prints a single header row first; preserve it and keep only
-      // the last `cap` data rows. Slicing the whole array from the end (as
-      // the previous version did) drops the header whenever rows > cap.
+      // Keep the header row and last `cap` data rows; slicing from the end alone would drop the header.
       const warnLines = warnEvents.split("\n");
       const [warnHeader, ...warnRows] = warnLines;
       const trimmedWarn =

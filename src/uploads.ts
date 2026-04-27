@@ -15,10 +15,9 @@ import type { Request, Response } from "express";
 import { BUNDLES_DIR, MAX_UPLOAD_BYTES, UPLOAD_DIR, UPLOAD_TTL_MS } from "./config.js";
 import { log } from "./log.js";
 
-// Tracks files we own via the upload endpoint; /bundles paths are never deleted.
+// Files owned via the upload endpoint; /bundles paths are never in here.
 export const uploadedPaths = new Set<string>();
 
-// Strips path components and restricts to safe charset + known archive extension.
 export function sanitizeFilename(raw: string): string | null {
   const base = raw.replace(/^.*[\\/]/, "");
   if (!base || base.length > 255) return null;
@@ -32,13 +31,12 @@ export function shellQuote(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
-// Wipe + recreate UPLOAD_DIR at startup so a previous crash can't leave orphans.
 export function initUploadDir(): void {
   try { rmSync(UPLOAD_DIR, { recursive: true, force: true }); } catch {}
   mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
-// Reaps idle uploads older than UPLOAD_TTL_MS. Skips the currently loaded file.
+// Deletes idle uploads older than UPLOAD_TTL_MS, skipping the currently loaded one.
 export function sweepUploads(currentBundlePath: string | null): void {
   if (!existsSync(UPLOAD_DIR)) return;
   const now = Date.now();
@@ -57,7 +55,6 @@ export function sweepUploads(currentBundlePath: string | null): void {
   }
 }
 
-// Deletes an upload file iff we own it; /bundles paths are user-owned and skipped.
 export function maybeDeleteUpload(p: string | null): void {
   if (!p || !uploadedPaths.has(p)) return;
   try {
@@ -97,7 +94,7 @@ export function listBundleFiles(): BundleFile[] {
   return out.sort((a, b) => b.modified.localeCompare(a.modified));
 }
 
-// Raw PUT upload — streams straight to disk; never sits behind a body parser.
+// Streams directly to disk; not behind a body parser.
 export function handleUpload(req: Request, res: Response): void {
   const safe = sanitizeFilename(req.params.name ?? "");
   if (!safe) {
@@ -114,7 +111,6 @@ export function handleUpload(req: Request, res: Response): void {
     return;
   }
 
-  // Disable per-request timeouts; large bundles over slow networks take time.
   req.setTimeout(0);
   res.setTimeout(0);
 
@@ -140,8 +136,7 @@ export function handleUpload(req: Request, res: Response): void {
     }
   });
   req.on("error", (err) => abort(500, err.message));
-  // Client aborted mid-stream: 'close' fires without 'error'/'end', so without
-  // this a partial file orphans until the TTL sweep.
+  // 'close' fires without 'error'/'end' on client abort; clean up the partial file.
   req.on("close", () => {
     if (!req.complete) abort(499, "Client closed connection before upload completed");
   });

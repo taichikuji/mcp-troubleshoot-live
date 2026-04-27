@@ -1,7 +1,4 @@
-// MCP best practice: NEVER log to stdout. STDIO transport multiplexes
-// JSON-RPC frames over stdout, so any stray stdout write corrupts the
-// channel. HTTP transports tolerate stdout, but we keep one rule everywhere
-// to avoid drift.
+// Never use stdout — STDIO transport multiplexes JSON-RPC over it.
 export const log = (...args: unknown[]): void => {
   console.error(...args);
 };
@@ -11,8 +8,7 @@ export type ToolResult = {
   isError?: boolean;
 };
 
-// Tool-level error boundary. Any unexpected throw inside a handler becomes a
-// well-formed `isError` result instead of a transport-level failure.
+// Converts unexpected throws into well-formed isError results.
 export async function safeRun(
   name: string,
   fn: () => Promise<ToolResult>,

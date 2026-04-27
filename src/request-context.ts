@@ -3,9 +3,7 @@ import type { Request } from "express";
 
 import { PORT, PUBLIC_URL_OVERRIDE } from "./config.js";
 
-// Per-request base URL so prepare_upload uses the host the client actually
-// reached us on. Lives in its own module so both transport.ts (writer) and
-// tools.ts (reader) can depend on it without forming a cycle.
+// Per-request base URL — in its own module so transport.ts and tools.ts can both import it without a cycle.
 export const requestContext = new AsyncLocalStorage<{ baseUrl: string }>();
 
 export function requestBaseUrl(req: Request): string {

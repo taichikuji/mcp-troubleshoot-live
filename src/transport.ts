@@ -8,9 +8,9 @@ import express, { type Express, type Request, type Response } from "express";
 import { requestBaseUrl, requestContext } from "./request-context.js";
 import { createServer } from "./tools.js";
 
-// Streamable HTTP transport: one McpServer+transport per session.
+// One McpServer+transport per session.
 const sessions = new Map<string, StreamableHTTPServerTransport>();
-// Legacy SSE — kept for clients still pointing at /sse.
+// Legacy SSE — kept for older client configs pointing at /sse.
 const sseTransports = new Map<string, SSEServerTransport>();
 
 async function handleStreamableHttp(req: Request, res: Response): Promise<void> {
@@ -45,8 +45,8 @@ async function handleStreamableHttp(req: Request, res: Response): Promise<void> 
     return;
   }
 
-  // Unknown sid: 404 so spec-compliant clients re-initialize cleanly.
-  if (sid) {
+    // 404 so spec-compliant clients re-initialize cleanly.
+    if (sid) {
     res.status(404).json({ error: "Session not found" });
     return;
   }
@@ -71,12 +71,9 @@ export function mountMcpRoutes(app: Express): void {
   app.use("/mcp", express.json());
 
   app.all("/mcp", async (req: Request, res: Response) => {
-    // Run every MCP HTTP exchange inside a context so prepare_upload can
-    // derive the right base URL.
     await requestContext.run({ baseUrl: requestBaseUrl(req) }, () => handleStreamableHttp(req, res));
   });
 
-  // Legacy SSE — must NOT have express.json() in front of it.
   app.get("/sse", async (_req: Request, res: Response) => {
     const transport = new SSEServerTransport("/messages", res);
     sseTransports.set(transport.sessionId, transport);

@@ -17,8 +17,7 @@ import { maybeDeleteUpload } from "./uploads.js";
 
 const execFileAsync = promisify(execFile);
 
-// Live bundle state. Exported as `let` so other modules see updates as they
-// happen. Mutation is contained to this file.
+// Bundle state — only mutated in this file.
 export let bundleReady = false;
 export let bundleLoading = false;
 export let bundleLoadError: string | null = null;
@@ -28,8 +27,7 @@ let bundleProcess: ChildProcess | null = null;
 
 export const isBundleProcessRunning = (): boolean => bundleProcess !== null;
 
-// Resolve a bundle reference to an absolute path under BUNDLES_DIR or
-// UPLOAD_DIR; rejects escapes.
+// Resolves to an absolute path under BUNDLES_DIR or UPLOAD_DIR; rejects path traversal.
 export function resolveBundlePath(input: string): string {
   const candidate = isAbsolute(input) ? input : join(BUNDLES_DIR, input);
   const abs = resolvePath(candidate);
@@ -63,7 +61,6 @@ export async function waitForCluster(maxWaitMs = CLUSTER_READY_TIMEOUT_MS): Prom
 export async function startBundle(bundlePath: string): Promise<void> {
   return new Promise((resolve, reject) => {
     log(`[MCP] Starting troubleshoot-live with bundle: ${bundlePath}`);
-    // New bundle == new dataset. Invalidate everything we cached for the old one.
     cacheClear();
 
     const child = spawn(
@@ -81,7 +78,7 @@ export async function startBundle(bundlePath: string): Promise<void> {
       fn();
     };
 
-    // Buffer output so early-exit errors surface to the LLM instead of vanishing into logs.
+    // Buffer output so early-exit errors surface to the LLM.
     const outputLines: string[] = [];
     const MAX_OUTPUT_LINES = 100;
     const captureLine = (prefix: string, d: Buffer) => {
@@ -106,14 +103,12 @@ export async function startBundle(bundlePath: string): Promise<void> {
       bundleReady = false;
       bundleProcess = null;
       currentBundlePath = null;
-      // Wipe extraction dir so re-loading the same bundle doesn't hit "is a directory".
       try { rmSync(TROUBLESHOOT_LIVE_WORKDIR, { recursive: true, force: true }); } catch {}
       const reason = signal ? `signal ${signal}` : `code ${code}`;
       log(`[MCP] troubleshoot-live exited with ${reason}`);
       const output = outputLines.join("\n").trim();
       const detail = output ? `\n\nProcess output:\n${output}` : "";
       const msg = `troubleshoot-live exited before becoming ready (${reason})${detail}`;
-      // If readyWatch hasn't already flipped state, do it here so cluster_status surfaces the crash.
       if (bundleLoading) {
         bundleLoading = false;
         bundleLoadError = msg;
@@ -126,11 +121,10 @@ export async function startBundle(bundlePath: string): Promise<void> {
   });
 }
 
-// SIGTERMs the child and waits for exit (or hard-kills after 5s).
 export async function stopBundle(timeoutMs = 10_000): Promise<void> {
   const child = bundleProcess;
   if (!child) return;
-  // Capture before exit fires — startBundle's own exit handler nulls currentBundlePath first.
+  // Capture before exit fires — the exit handler in startBundle nulls currentBundlePath first.
   const wasPath = currentBundlePath;
   log("[MCP] Stopping troubleshoot-live…");
 
@@ -162,17 +156,14 @@ export async function stopBundle(timeoutMs = 10_000): Promise<void> {
   });
 }
 
-// Marks the bundle as loading. Used by the start_bundle tool before kicking
-// off the readiness watch. Keeps mutation localized.
 export function markLoading(): void {
   bundleReady = false;
   bundleLoading = true;
   bundleLoadError = null;
 }
 
-// Called from the background readiness watch in tools.ts.
 export function markReady(ok: boolean, expectedPath: string): void {
-  // Guard: another start_bundle/stop_bundle may have superseded us.
+  // Another start_bundle/stop_bundle may have superseded us.
   if (currentBundlePath !== expectedPath) return;
   bundleReady = ok;
   bundleLoading = false;
@@ -188,8 +179,7 @@ export function markFailed(msg: string): void {
   bundleLoadError = msg;
 }
 
-// Returns null if the cluster is ready, otherwise a tool-result that explains
-// why not. Centralizes the "not ready" messaging so all kubectl tools share it.
+// Returns null if ready, otherwise a tool result with a clear "not ready" message.
 export function requireReady(): ToolResult | null {
   if (bundleReady) return null;
   if (bundleLoading) {

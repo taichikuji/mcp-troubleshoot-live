@@ -13,9 +13,8 @@ export const READ_ONLY_VERBS = new Set([
   "version", "cluster-info", "config", "auth", "events", "wait",
 ]);
 
-// Shell-style tokenizer with single/double quotes and backslash escapes; no
-// shell invocation. The only thing protecting kubectl_run from a model that
-// passes args via a single string field is this function — keep it strict.
+// Shell-style tokenizer (quotes + backslash, no shell invocation).
+// Only thing protecting kubectl_run from shell metacharacters — don't simplify it.
 export function tokenize(input: string): string[] {
   const tokens: string[] = [];
   let current = "";
@@ -59,8 +58,7 @@ export function tokenize(input: string): string[] {
   return tokens;
 }
 
-// troubleshoot-live's proxy briefly drops the listener during bundle import.
-// Retry transient connection errors; everything else fails fast.
+// The proxy briefly drops the listener during bundle import — retry on these.
 function isTransientKubectlError(stderr: string): boolean {
   return (
     /connection refused/i.test(stderr) ||
@@ -70,8 +68,7 @@ function isTransientKubectlError(stderr: string): boolean {
   );
 }
 
-// Append a "narrow your query" hint when output is huge. We never truncate
-// silently — the LLM gets the full text and a clear breadcrumb.
+// Appends a narrowing hint on large responses. Never silently truncates.
 export function withSizeHint(text: string): string {
   if (text.length <= RESPONSE_SOFT_LIMIT_BYTES) return text;
   const kb = (text.length / 1024).toFixed(0);
@@ -82,7 +79,6 @@ export function withSizeHint(text: string): string {
   );
 }
 
-// Common helper: scope to namespace, or all-namespaces when none provided.
 export function nsArgs(namespace: string | undefined, allNamespacesFallback = true): string[] {
   if (namespace) return ["-n", namespace];
   return allNamespacesFallback ? ["-A"] : [];
@@ -90,8 +86,6 @@ export function nsArgs(namespace: string | undefined, allNamespacesFallback = tr
 
 export async function runKubectl(args: string[]): Promise<string> {
   if (!existsSync(KUBECONFIG_PATH)) {
-    // Don't cache "no kubeconfig" — it's a transient state that ends as soon
-    // as a bundle loads.
     return "No kubeconfig found. Start a bundle first with the start_bundle tool.";
   }
   const cached = cacheGet(args);
@@ -107,16 +101,13 @@ export async function runKubectl(args: string[]): Promise<string> {
         { timeout: KUBECTL_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 },
       );
       const out = (stdout || stderr).trim();
-      // Only cache successful calls. Errors are usually transient (loading,
-      // proxy hiccup, missing namespace) and we want the next call to retry.
       cacheSet(args, out);
       return withSizeHint(out);
     } catch (err: unknown) {
       lastErr = err as { message: string; stderr?: string };
       const stderr = lastErr.stderr ?? "";
       if (attempt < maxAttempts && isTransientKubectlError(stderr)) {
-        // Backoff 250ms, 500ms, 1s; worst-case +1.75s.
-        await new Promise((r) => setTimeout(r, 250 * 2 ** (attempt - 1)));
+        await new Promise((r) => setTimeout(r, 250 * 2 ** (attempt - 1))); // 250ms, 500ms, 1s
         continue;
       }
       break;
