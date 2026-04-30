@@ -4,6 +4,7 @@ import { z, type ZodRawShape } from "zod";
 import {
   bundleLoadError,
   bundleLoading,
+  bundlePhase,
   bundleReady,
   currentBundlePath,
   isBundleProcessRunning,
@@ -18,7 +19,6 @@ import {
 } from "./bundle.js";
 import {
   BUNDLES_DIR,
-  CLUSTER_READY_TIMEOUT_MS,
   MAX_UPLOAD_BYTES,
   PROXY_ADDRESS,
   UPLOAD_DIR,
@@ -42,8 +42,10 @@ const INSTRUCTIONS = [
   "   then `start_bundle <name>` directly — no upload needed.",
   "3. `start_bundle` returns IMMEDIATELY with status='loading' (or 'ready' if already",
   "   loaded). Then poll `cluster_status` every few seconds until it reports 'ready'.",
-  "   Cold loads can take 1–3 minutes (envtest binary download); warm loads ~5–30s.",
-  "   Do NOT call other inspection tools until `cluster_status` says 'ready'.",
+  "   `cluster_status` exposes a `phase` field (spawning → starting_apiserver →",
+  "   importing → ready) so you know which stage you're in. First-ever load also",
+  "   downloads ~185 MB of envtest binaries during `starting_apiserver` (one-off,",
+  "   cached afterwards). Do NOT call other inspection tools until status='ready'.",
   "4. Once ready, prefer `cluster_overview` for the first triage pass — it batches",
   "   nodes, namespaces, not-ready pods, and Warning events in one call. Then drill",
   "   in with `get_pod_logs`, `describe_resource`, `kubectl_run`, etc.",
@@ -66,6 +68,18 @@ const INSTRUCTIONS = [
   "Do NOT run troubleshoot-live or kubectl directly on the user's machine; this MCP",
   "owns the live cluster.",
 ].join("\n");
+
+// Per-phase poll hint surfaced through cluster_status.
+const PHASE_HINTS: Record<string, string> = {
+  spawning: "troubleshoot-live just started. Poll again in ~2s.",
+  starting_apiserver:
+    "envtest apiserver booting. ~5–15s warm; up to ~2min on first-ever run (one-off ~185 MB binary download). Poll every 5s.",
+  importing:
+    "apiserver up; importing bundle resources (CRDs, namespaces, pods, events). ~30s–2min for large bundles. Poll every 5–10s.",
+  ready: "ready.",
+  failed: "load failed. See bundleLoadError.",
+  idle: "no bundle loaded.",
+};
 
 // Cluster-ready guard + error boundary for tool handlers.
 async function readyTool(name: string, fn: () => Promise<ToolResult>): Promise<ToolResult> {
@@ -148,7 +162,7 @@ export function createServer(): McpServer {
     "start_bundle",
     {
       description:
-        "Load a support bundle into the live cluster. Returns IMMEDIATELY with status='ready' (warm, already loaded) or status='loading' (apiserver not yet up). If status is 'loading', poll `cluster_status` every few seconds until it reports 'ready' before calling other inspection tools. Cold loads take 1–3 minutes (envtest binary download); warm loads ~5–30s. Pass: (a) a bare filename in /bundles, (b) an absolute path under /bundles, or (c) the path/name returned by `prepare_upload`. If the bundle lives only on the user's local machine, call `prepare_upload` FIRST.",
+        "Load a support bundle into the live cluster. Returns IMMEDIATELY with status='ready' (warm, already loaded) or status='loading' (apiserver not yet up). If status is 'loading', poll `cluster_status` every few seconds until it reports 'ready' before calling other inspection tools — `cluster_status` includes a `phase` field that tells you which stage is in flight. Pass: (a) a bare filename in /bundles, (b) an absolute path under /bundles, or (c) the path/name returned by `prepare_upload`. If the bundle lives only on the user's local machine, call `prepare_upload` FIRST.",
       inputSchema: {
         bundle_path: z
           .string()
@@ -209,7 +223,7 @@ export function createServer(): McpServer {
       })();
 
       return textResult(
-        `status=loading. Bundle '${resolved}' is starting. Poll cluster_status every few seconds until it reports ready before using other inspection tools.`,
+        `status=loading, phase=${bundlePhase}. Bundle '${resolved}' is starting. Poll cluster_status every few seconds until it reports ready before using other inspection tools.`,
       );
     }),
   );
@@ -263,25 +277,25 @@ export function createServer(): McpServer {
     "cluster_status",
     {
       description:
-        "Report the cluster's load state. Use this to poll after start_bundle. Returns one of: status=ready (use inspection tools now), status=loading (poll again in a few seconds), status=failed (load crashed; includes reason), status=idle (no bundle loaded).",
+        "Report the cluster's load state. Use this to poll after start_bundle. Returns one of: status=ready (use inspection tools now), status=loading (poll again in a few seconds; includes a `phase` field), status=failed (load crashed; includes reason), status=idle (no bundle loaded).",
     },
     async () => safeRun("cluster_status", async () => {
       if (bundleReady) {
         return textResult(
-          `status=ready\nLoaded bundle: ${currentBundlePath}\n\n` +
+          `status=ready, phase=ready\nLoaded bundle: ${currentBundlePath}\n\n` +
             (await runKubectl(["get", "namespaces"])),
         );
       }
       if (bundleLoading) {
         return textResult(
-          `status=loading\nLoading bundle: ${currentBundlePath}\nPoll cluster_status again in a few seconds. Cold loads can take 1–3 minutes.`,
+          `status=loading, phase=${bundlePhase}\nLoading bundle: ${currentBundlePath}\n${PHASE_HINTS[bundlePhase]}`,
         );
       }
       if (bundleLoadError) {
-        return errorResult(`status=failed\nLast load error:\n${bundleLoadError}`);
+        return errorResult(`status=failed, phase=failed\nLast load error:\n${bundleLoadError}`);
       }
       return textResult(
-        "status=idle\nNo bundle loaded. Use list_bundles to see available bundles, then start_bundle to load one.",
+        "status=idle, phase=idle\nNo bundle loaded. Use list_bundles to see available bundles, then start_bundle to load one.",
       );
     }),
   );

@@ -1,7 +1,6 @@
-import { execFile, spawn, type ChildProcess } from "child_process";
+import { spawn, type ChildProcess } from "child_process";
 import { existsSync, rmSync, unlinkSync } from "fs";
 import { isAbsolute, join, resolve as resolvePath } from "path";
-import { promisify } from "util";
 
 import { cacheClear } from "./cache.js";
 import {
@@ -15,19 +14,34 @@ import {
 import { errorResult, log, type ToolResult } from "./log.js";
 import { maybeDeleteUpload } from "./uploads.js";
 
-const execFileAsync = promisify(execFile);
-
-// Bundle state — only mutated in this file.
+// Bundle state. Only mutated here.
 export let bundleReady = false;
 export let bundleLoading = false;
 export let bundleLoadError: string | null = null;
 export let currentBundlePath: string | null = null;
+export type BundlePhase =
+  | "idle"
+  | "spawning"
+  | "starting_apiserver"
+  | "importing"
+  | "ready"
+  | "failed";
+export let bundlePhase: BundlePhase = "idle";
 
 let bundleProcess: ChildProcess | null = null;
 
+// Ready signal driven off troubleshoot-live's stderr. Reset per start.
+type Deferred<T> = { promise: Promise<T>; resolve: (value: T) => void };
+const deferred = <T>(): Deferred<T> => {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => { resolve = r; });
+  return { promise, resolve };
+};
+let readySignal = deferred<boolean>();
+
 export const isBundleProcessRunning = (): boolean => bundleProcess !== null;
 
-// Resolves to an absolute path under BUNDLES_DIR or UPLOAD_DIR; rejects path traversal.
+// Resolve to an absolute path under BUNDLES_DIR or UPLOAD_DIR. Rejects traversal.
 export function resolveBundlePath(input: string): string {
   const candidate = isAbsolute(input) ? input : join(BUNDLES_DIR, input);
   const abs = resolvePath(candidate);
@@ -41,27 +55,34 @@ export function resolveBundlePath(input: string): string {
   return abs;
 }
 
+// Wait for the proxy-up stderr line, or give up at the deadline.
 export async function waitForCluster(maxWaitMs = CLUSTER_READY_TIMEOUT_MS): Promise<boolean> {
-  const deadline = Date.now() + maxWaitMs;
-  while (Date.now() < deadline && bundleProcess !== null) {
-    try {
-      await execFileAsync(
-        "kubectl",
-        [`--kubeconfig=${KUBECONFIG_PATH}`, "get", "namespaces"],
-        { timeout: 5_000 },
-      );
-      return true;
-    } catch {
-      await new Promise((r) => setTimeout(r, 2_000));
-    }
+  const timeout = new Promise<boolean>((resolve) => {
+    const t = setTimeout(() => resolve(false), maxWaitMs);
+    t.unref();
+  });
+  return Promise.race([readySignal.promise, timeout]);
+}
+
+// Move the phase forward off upstream stderr markers.
+function observePhase(line: string): void {
+  if (bundlePhase === "ready" || bundlePhase === "failed") return;
+  if (line.includes("Running HTTPs proxy service on")) {
+    readySignal.resolve(true);
+    return;
   }
-  return false;
+  if (line.includes("Importing bundle resources")) {
+    bundlePhase = "importing";
+  } else if (line.includes("Starting k8s server")) {
+    bundlePhase = "starting_apiserver";
+  }
 }
 
 export async function startBundle(bundlePath: string): Promise<void> {
   return new Promise((resolve, reject) => {
     log(`[MCP] Starting troubleshoot-live with bundle: ${bundlePath}`);
     cacheClear();
+    readySignal = deferred<boolean>();
 
     const child = spawn(
       "troubleshoot-live",
@@ -78,7 +99,7 @@ export async function startBundle(bundlePath: string): Promise<void> {
       fn();
     };
 
-    // Buffer output so early-exit errors surface to the LLM.
+    // Keep recent stderr/stdout so an early-exit error message is useful.
     const outputLines: string[] = [];
     const MAX_OUTPUT_LINES = 100;
     const captureLine = (prefix: string, d: Buffer) => {
@@ -88,15 +109,20 @@ export async function startBundle(bundlePath: string): Promise<void> {
         if (content.length === 0) continue;
         outputLines.push(`${prefix}: ${content}`);
         if (outputLines.length > MAX_OUTPUT_LINES) outputLines.shift();
+        if (prefix === "stderr") observePhase(content);
       }
     };
 
     child.stdout?.on("data", (d: Buffer) => captureLine("stdout", d));
     child.stderr?.on("data", (d: Buffer) => captureLine("stderr", d));
 
+    // 'spawn' fires only on successful exec; 'error' fires on missing binary.
+    child.once("spawn", () => settle(() => resolve()));
     child.on("error", (err) => {
       bundleLoading = false;
       bundleLoadError = err.message;
+      bundlePhase = "failed";
+      readySignal.resolve(false);
       settle(() => reject(err));
     });
     child.on("exit", (code, signal) => {
@@ -113,18 +139,17 @@ export async function startBundle(bundlePath: string): Promise<void> {
         bundleLoading = false;
         bundleLoadError = msg;
       }
+      bundlePhase = "failed";
+      readySignal.resolve(false);
       settle(() => reject(new Error(msg)));
     });
-
-    // Brief grace period before the caller starts polling.
-    setTimeout(() => settle(() => resolve()), 2_000);
   });
 }
 
 export async function stopBundle(timeoutMs = 10_000): Promise<void> {
   const child = bundleProcess;
   if (!child) return;
-  // Capture before exit fires — the exit handler in startBundle nulls currentBundlePath first.
+  // Grab this before exit fires — the exit handler nulls it.
   const wasPath = currentBundlePath;
   log("[MCP] Stopping troubleshoot-live…");
 
@@ -138,6 +163,7 @@ export async function stopBundle(timeoutMs = 10_000): Promise<void> {
       bundleLoadError = null;
       bundleProcess = null;
       currentBundlePath = null;
+      bundlePhase = "idle";
       cacheClear();
       try { if (existsSync(KUBECONFIG_PATH)) unlinkSync(KUBECONFIG_PATH); } catch {}
       try { rmSync(TROUBLESHOOT_LIVE_WORKDIR, { recursive: true, force: true }); } catch {}
@@ -160,13 +186,15 @@ export function markLoading(): void {
   bundleReady = false;
   bundleLoading = true;
   bundleLoadError = null;
+  bundlePhase = "spawning";
 }
 
 export function markReady(ok: boolean, expectedPath: string): void {
-  // Another start_bundle/stop_bundle may have superseded us.
+  // A newer start_bundle/stop_bundle may have superseded this one.
   if (currentBundlePath !== expectedPath) return;
   bundleReady = ok;
   bundleLoading = false;
+  bundlePhase = ok ? "ready" : "failed";
   if (!ok && !bundleLoadError) {
     bundleLoadError = `Kubernetes API did not become ready within ${Math.round(
       CLUSTER_READY_TIMEOUT_MS / 1000,
@@ -177,14 +205,15 @@ export function markReady(ok: boolean, expectedPath: string): void {
 export function markFailed(msg: string): void {
   bundleLoading = false;
   bundleLoadError = msg;
+  bundlePhase = "failed";
 }
 
-// Returns null if ready, otherwise a tool result with a clear "not ready" message.
+// Null when ready; otherwise a tool result describing why it isn't.
 export function requireReady(): ToolResult | null {
   if (bundleReady) return null;
   if (bundleLoading) {
     return errorResult(
-      `Cluster is still loading bundle '${currentBundlePath}'. Poll cluster_status every few seconds until it reports ready, then retry this tool.`,
+      `Cluster is still loading bundle '${currentBundlePath}' (phase=${bundlePhase}). Poll cluster_status every few seconds until it reports ready, then retry this tool.`,
     );
   }
   if (bundleLoadError) {
