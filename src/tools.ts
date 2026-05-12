@@ -1,5 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { z, type ZodRawShape } from "zod";
+import { z } from "zod";
 
 import {
   bundleLoadError,
@@ -26,47 +26,22 @@ import {
 } from "./config.js";
 import { READ_ONLY_VERBS, runKubectl, tokenize } from "./kubectl.js";
 import { errorResult, log, safeRun, textResult, type ToolResult } from "./log.js";
-import { kindSchema, namespaceSchema, resourceNameSchema, sinceSchema } from "./schemas.js";
 import { uploadBaseUrl } from "./request-context.js";
 import { listBundleFiles, sanitizeFilename, shellQuote } from "./uploads.js";
 
 const INSTRUCTIONS = [
-  "Tools for inspecting Kubernetes support bundles via troubleshoot-live.",
+  "WORKFLOW:",
+  "1. Always call list_bundles first. If the bundle is present, go to step 3.",
+  "2. Bundle on user machine: prepare_upload → run returned curl on user machine → pass path to start_bundle.",
+  "3. start_bundle returns immediately. Poll cluster_status until status=ready. Do NOT inspect before then.",
+  "4. First triage: cluster_overview (nodes, namespaces, not-ready pods, warnings — one call).",
+  "5. All further queries: kubectl_run. Always pass --tail=N when fetching logs.",
+  "6. When done: stop_bundle.",
   "",
-  "WORKFLOW for investigating a bundle:",
-  "1. If the user names a bundle file on THEIR local machine (e.g. ~/Downloads/foo.tar.gz),",
-  "   call `prepare_upload` FIRST. It returns a curl command. Run that curl via your",
-  "   shell tool on the user's machine. Parse the JSON response and pass the returned",
-  "   `path` (or `name`) to `start_bundle`.",
-  "2. If the bundle is already on the MCP server, call `list_bundles` to discover names,",
-  "   then `start_bundle <name>` directly — no upload needed.",
-  "3. `start_bundle` returns IMMEDIATELY with status='loading' (or 'ready' if already",
-  "   loaded). Then poll `cluster_status` every few seconds until it reports 'ready'.",
-  "   `cluster_status` exposes a `phase` field (spawning → starting_apiserver →",
-  "   importing → ready) so you know which stage you're in. First-ever load also",
-  "   downloads ~185 MB of envtest binaries during `starting_apiserver` (one-off,",
-  "   cached afterwards). Do NOT call other inspection tools until status='ready'.",
-  "4. Once ready, prefer `cluster_overview` for the first triage pass — it batches",
-  "   nodes, namespaces, not-ready pods, and Warning events in one call. Then drill",
-  "   in with `get_pod_logs`, `get_resource`, `kubectl_run`, etc.",
-  "5. When done, call `stop_bundle`. Uploaded bundles are deleted from the server then;",
-  "   bundles that lived under /bundles are left alone.",
-  "",
-  "PERFORMANCE NOTES:",
-  "- The loaded bundle is immutable; kubectl results are cached for 5 minutes by",
-  "  default (KUBECTL_CACHE_TTL_MS). Repeating the same query within the TTL is free.",
-  "  The cache is cleared automatically when the bundle changes.",
-  "- Use `cluster_overview` for general health checks; it replaces 3–4 separate calls",
-  "  and runs the underlying kubectls in parallel.",
-  "- Per-call kubectl timeout is 30 s; transient connection errors retry up to 4×.",
-  "- `kubectl_run` accepts at most 64 tokens / 4096 chars and only read-only verbs",
-  "  (get, describe, logs, top, explain, api-resources, api-versions, version,",
-  "  cluster-info, config, auth, events, wait).",
-  "- Responses larger than 200 KB include a hint to narrow the query (with",
-  "  --selector, --field-selector, -n, or a single resource name).",
-  "",
-  "Do NOT run troubleshoot-live or kubectl directly on the user's machine; this MCP",
-  "owns the live cluster.",
+  "RULES:",
+  "- kubectl_run only: read-only verbs, no shell pipes — use --selector/--field-selector or the grep param.",
+  "- Large responses (>200 KB) include a narrowing hint.",
+  "- Do NOT run kubectl or troubleshoot-live directly on the user's machine.",
 ].join("\n");
 
 // Per-phase poll hint surfaced through cluster_status.
@@ -86,28 +61,6 @@ async function readyTool(name: string, fn: () => Promise<ToolResult>): Promise<T
   return safeRun(name, async () => requireReady() ?? (await fn()));
 }
 
-// Registers a typed kubectl tool, wiring schema → readyTool → runKubectl.
-type KubectlToolOpts<S extends ZodRawShape> = {
-  description: string;
-  inputSchema?: S;
-  buildArgs: (params: z.infer<z.ZodObject<S>>) => string[];
-};
-function registerKubectlTool<S extends ZodRawShape>(
-  server: McpServer,
-  name: string,
-  opts: KubectlToolOpts<S>,
-): void {
-  server.registerTool(
-    name,
-    {
-      description: opts.description,
-      ...(opts.inputSchema ? { inputSchema: opts.inputSchema } : {}),
-    },
-    // Cast needed: SDK doesn't export the generic cleanly; Zod still validates at runtime.
-    (async (params: z.infer<z.ZodObject<S>>) =>
-      readyTool(name, async () => textResult(await runKubectl(opts.buildArgs(params))))) as never,
-  );
-}
 
 export function createServer(): McpServer {
   const server = new McpServer(
@@ -356,71 +309,7 @@ export function createServer(): McpServer {
     }),
   );
 
-  // ── Targeted inspection tools ──────────────────────────────────────────
-
-  registerKubectlTool(server, "get_pod_logs", {
-    description: "Get logs from a specific pod container.",
-    inputSchema: {
-      pod: resourceNameSchema.describe("Pod name"),
-      namespace: namespaceSchema.describe("Namespace the pod lives in"),
-      container: resourceNameSchema
-        .optional()
-        .describe("Container name (required only for multi-container pods)"),
-      tail: z
-        .number()
-        .int()
-        .positive()
-        .max(100_000)
-        .optional()
-        .describe("Number of lines to return from the end of the log (default 100, max 100000)"),
-      previous: z
-        .boolean()
-        .optional()
-        .describe("Return logs from the previously terminated container instance"),
-      since: sinceSchema
-        .optional()
-        .describe("Only return logs newer than a relative duration like 5s, 2m, or 3h"),
-      timestamps: z
-        .boolean()
-        .optional()
-        .describe("Include RFC3339 timestamps on each log line"),
-    },
-    buildArgs: ({ pod, namespace, container, tail, previous, since, timestamps }) => {
-      const args = ["logs", pod, "-n", namespace, `--tail=${tail ?? 100}`];
-      if (container) args.push("-c", container);
-      if (previous) args.push("--previous");
-      if (since) args.push(`--since=${since}`);
-      if (timestamps) args.push("--timestamps");
-      return args;
-    },
-  });
-
-  registerKubectlTool(server, "get_resource", {
-    description: "Get any Kubernetes resource with a configurable output format.",
-    inputSchema: {
-      kind: kindSchema.describe(
-        "Resource kind or plural (e.g. pods, configmaps, secrets, nodes, persistentvolumes, replicasets)",
-      ),
-      name: resourceNameSchema.optional().describe("Specific resource name (omit to list all)"),
-      namespace: namespaceSchema
-        .optional()
-        .describe("Namespace (omit for cluster-scoped resources or to list all namespaces)"),
-      output: z
-        .enum(["wide", "yaml", "json", "name"])
-        .optional()
-        .describe("Output format (default: wide)"),
-    },
-    buildArgs: ({ kind, name, namespace, output }) => {
-      const args = ["get", kind];
-      if (name) args.push(name);
-      if (namespace) args.push("-n", namespace);
-      else if (!name) args.push("-A");
-      args.push("-o", output ?? "wide");
-      return args;
-    },
-  });
-
-  // ── Power-user escape hatch ────────────────────────────────────────────
+  // ── Targeted queries ───────────────────────────────────────────────────
 
   server.registerTool(
     "kubectl_run",
