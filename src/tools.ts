@@ -24,7 +24,7 @@ import {
   UPLOAD_DIR,
   UPLOAD_TTL_MS,
 } from "./config.js";
-import { nsArgs, READ_ONLY_VERBS, runKubectl, tokenize } from "./kubectl.js";
+import { READ_ONLY_VERBS, runKubectl, tokenize } from "./kubectl.js";
 import { errorResult, log, safeRun, textResult, type ToolResult } from "./log.js";
 import { kindSchema, namespaceSchema, resourceNameSchema, sinceSchema } from "./schemas.js";
 import { uploadBaseUrl } from "./request-context.js";
@@ -48,7 +48,7 @@ const INSTRUCTIONS = [
   "   cached afterwards). Do NOT call other inspection tools until status='ready'.",
   "4. Once ready, prefer `cluster_overview` for the first triage pass — it batches",
   "   nodes, namespaces, not-ready pods, and Warning events in one call. Then drill",
-  "   in with `get_pod_logs`, `describe_resource`, `kubectl_run`, etc.",
+  "   in with `get_pod_logs`, `get_resource`, `kubectl_run`, etc.",
   "5. When done, call `stop_bundle`. Uploaded bundles are deleted from the server then;",
   "   bundles that lived under /bundles are left alone.",
   "",
@@ -86,7 +86,7 @@ async function readyTool(name: string, fn: () => Promise<ToolResult>): Promise<T
   return safeRun(name, async () => requireReady() ?? (await fn()));
 }
 
-// Registers a kubectl tool with an optional namespace param, cutting boilerplate.
+// Registers a typed kubectl tool, wiring schema → readyTool → runKubectl.
 type KubectlToolOpts<S extends ZodRawShape> = {
   description: string;
   inputSchema?: S;
@@ -121,7 +121,7 @@ export function createServer(): McpServer {
     "prepare_upload",
     {
       description:
-        "Use this FIRST when the user wants to investigate a support bundle that lives on their local machine and is not yet on the MCP server. Returns a `curl` command to push the bundle from the user's machine to the MCP server's upload endpoint. Run that curl via your shell tool, then pass the returned path/name to `start_bundle`. If the bundle already lives in the server's bundles directory, skip this and use `list_bundles` + `start_bundle` instead.",
+        "Use this when the user wants to investigate a support bundle that lives on their local machine and is not yet on the MCP server. BEFORE calling this, always call `list_bundles` first — the bundle may already be present, saving upload time. Returns a `curl` command to push the bundle from the user's machine to the MCP server's upload endpoint. Run that curl via your shell tool, then pass the returned path/name to `start_bundle`.",
       inputSchema: {
         local_path: z
           .string()
@@ -306,7 +306,7 @@ export function createServer(): McpServer {
     "cluster_overview",
     {
       description:
-        "Batch tool: returns nodes, namespaces, not-ready pods across all namespaces, and recent Warning events in a single call. Use this FIRST for general triage instead of running list_namespaces + get_nodes + get_pods + get_events separately. Saves 3+ round-trips and caches all four results for follow-up calls.",
+        "Batch tool: returns nodes, namespaces, not-ready pods across all namespaces, and recent Warning events in a single call. Use this FIRST for general triage — it saves 4 round-trips and caches all results for follow-up calls.",
       inputSchema: {
         warning_event_limit: z
           .number()
@@ -356,43 +356,7 @@ export function createServer(): McpServer {
     }),
   );
 
-  // ── Standard kubectl read tools ────────────────────────────────────────
-
-  registerKubectlTool(server, "list_namespaces", {
-    description: "List all namespaces in the support bundle cluster.",
-    buildArgs: () => ["get", "namespaces", "-o", "wide"],
-  });
-
-  registerKubectlTool(server, "get_nodes", {
-    description: "List nodes and their status/conditions.",
-    buildArgs: () => ["get", "nodes", "-o", "wide"],
-  });
-
-  registerKubectlTool(server, "get_pods", {
-    description: "List pods, optionally filtered by namespace.",
-    inputSchema: {
-      namespace: namespaceSchema
-        .optional()
-        .describe("Kubernetes namespace. Omit to list across all namespaces."),
-    },
-    buildArgs: ({ namespace }) => ["get", "pods", ...nsArgs(namespace), "-o", "wide"],
-  });
-
-  registerKubectlTool(server, "get_deployments", {
-    description: "List deployments, optionally filtered by namespace.",
-    inputSchema: {
-      namespace: namespaceSchema.optional().describe("Namespace. Omit for all namespaces."),
-    },
-    buildArgs: ({ namespace }) => ["get", "deployments", ...nsArgs(namespace), "-o", "wide"],
-  });
-
-  registerKubectlTool(server, "get_services", {
-    description: "List services, optionally filtered by namespace.",
-    inputSchema: {
-      namespace: namespaceSchema.optional().describe("Namespace. Omit for all namespaces."),
-    },
-    buildArgs: ({ namespace }) => ["get", "services", ...nsArgs(namespace), "-o", "wide"],
-  });
+  // ── Targeted inspection tools ──────────────────────────────────────────
 
   registerKubectlTool(server, "get_pod_logs", {
     description: "Get logs from a specific pod container.",
@@ -431,39 +395,6 @@ export function createServer(): McpServer {
     },
   });
 
-  registerKubectlTool(server, "get_events", {
-    description: "Get Kubernetes events sorted by time. Useful for spotting warnings and failures.",
-    inputSchema: {
-      namespace: namespaceSchema
-        .optional()
-        .describe("Namespace to scope events to. Omit for all namespaces."),
-      warning_only: z
-        .boolean()
-        .optional()
-        .describe("If true, show only Warning events (filters out Normal)"),
-    },
-    buildArgs: ({ namespace, warning_only }) => {
-      const args = ["get", "events", ...nsArgs(namespace), "--sort-by=.lastTimestamp"];
-      if (warning_only) args.push("--field-selector=type=Warning");
-      return args;
-    },
-  });
-
-  registerKubectlTool(server, "describe_resource", {
-    description:
-      "Describe any Kubernetes resource (equivalent to kubectl describe). Great for seeing status, conditions, and recent events.",
-    inputSchema: {
-      kind: kindSchema.describe(
-        "Resource kind (e.g. pod, deployment, service, configmap, node, persistentvolumeclaim)",
-      ),
-      name: resourceNameSchema.describe("Resource name"),
-      namespace: namespaceSchema
-        .optional()
-        .describe("Namespace (not needed for cluster-scoped resources like nodes)"),
-    },
-    buildArgs: ({ kind, name, namespace }) => ["describe", kind, name, ...nsArgs(namespace, false)],
-  });
-
   registerKubectlTool(server, "get_resource", {
     description: "Get any Kubernetes resource with a configurable output format.",
     inputSchema: {
@@ -498,7 +429,7 @@ export function createServer(): McpServer {
         ...READ_ONLY_VERBS,
       ]
         .sort()
-        .join(", ")}. Mutating verbs (apply, delete, edit, patch, exec, cp, drain, scale, etc.) are rejected. Do not include the 'kubectl' prefix.`,
+        .join(", ")}. Mutating verbs (apply, delete, edit, patch, exec, cp, drain, scale, etc.) are rejected. Do not include the 'kubectl' prefix. Shell pipes (|) and operators are NOT supported — use --selector, --field-selector, or the 'grep' parameter to filter output instead.`,
       inputSchema: {
         args: z
           .string()
@@ -507,9 +438,19 @@ export function createServer(): McpServer {
           .describe(
             "kubectl arguments, e.g. 'get nodes -o yaml' or 'top pods -A' or 'api-resources'",
           ),
+        grep: z
+          .string()
+          .optional()
+          .describe(
+            "Filter output lines to those matching this string or regex pattern. Applied after kubectl runs. Use instead of shell pipes.",
+          ),
+        grep_ignore_case: z
+          .boolean()
+          .optional()
+          .describe("If true, the grep filter is case-insensitive (default false)."),
       },
     },
-    async ({ args }) => readyTool("kubectl_run", async () => {
+    async ({ args, grep, grep_ignore_case }) => readyTool("kubectl_run", async () => {
       let tokens: string[];
       try {
         tokens = tokenize(args);
@@ -532,8 +473,29 @@ export function createServer(): McpServer {
             .join(", ")}.`,
         );
       }
-      return textResult(await runKubectl(tokens));
+      let output = await runKubectl(tokens);
+      if (grep) {
+        let pattern: RegExp;
+        try {
+          pattern = new RegExp(grep, grep_ignore_case ? "i" : "");
+        } catch {
+          return errorResult(`Invalid grep pattern: ${grep}`);
+        }
+        const lines = output.split("\n");
+        const filtered = lines.filter((line) => pattern.test(line));
+        output = filtered.length > 0 ? filtered.join("\n") : "(no lines matched filter)";
+      }
+      return textResult(output);
     }),
+  );
+
+  server.registerTool(
+    "help",
+    {
+      description:
+        "Return the recommended workflow and usage notes for this MCP server. Call this if you are unsure which tool to use next or want to review the investigation workflow.",
+    },
+    async () => safeRun("help", async () => textResult(INSTRUCTIONS)),
   );
 
   return server;

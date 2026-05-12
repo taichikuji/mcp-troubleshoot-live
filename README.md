@@ -16,7 +16,7 @@ It boots an envtest Kubernetes apiserver from a support bundle and gives your AI
 
 Digging through Kubernetes support bundles manually is tedious. I wanted to just *talk* to my bundle instead.
 
-With 16 curated `kubectl` tools, you can triage conversationally — even when the bundle only lives on your local machine.
+With 10 curated tools, you can triage conversationally — even when the bundle only lives on your local machine.
 
 ## How do I use it?
 
@@ -55,7 +55,7 @@ Two ways:
 
 ## What tools does it have?
 
-It comes packed with 16 typed MCP tools to help you out!
+It comes packed with 10 focused tools to help you out!
 
 | Tool | Purpose |
 | --- | --- |
@@ -65,16 +65,10 @@ It comes packed with 16 typed MCP tools to help you out!
 | `stop_bundle` | Unloads the current bundle and cleans up. |
 | `cluster_status` | Reports if the cluster is `idle`, `loading`, `ready`, or `failed`. |
 | `cluster_overview` | **Batched triage tool!** Gets nodes, namespaces, not-ready pods, and warnings in one go. |
-| `list_namespaces` | `kubectl get namespaces -o wide` |
-| `get_nodes` | `kubectl get nodes -o wide` |
-| `get_pods` | List pods (optionally by namespace). |
-| `get_deployments` | List deployments. |
-| `get_services` | List services. |
-| `get_pod_logs` | Grab pod logs (supports `tail`, `previous`, `since`). |
-| `get_events` | Get events sorted by time. |
-| `describe_resource` | `kubectl describe <kind> <name>` |
-| `get_resource` | Generic `kubectl get` with custom output formats. |
-| `kubectl_run` | Read-only escape hatch for custom queries! |
+| `get_pod_logs` | Grab pod logs (supports `tail`, `previous`, `since`, `timestamps`). |
+| `get_resource` | Generic `kubectl get` with configurable output format. |
+| `kubectl_run` | Read-only kubectl escape hatch — supports `grep` filter param. |
+| `help` | Print the recommended investigation workflow and usage notes. |
 
 ## Configuration
 
