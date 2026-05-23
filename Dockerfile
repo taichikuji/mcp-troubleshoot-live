@@ -61,6 +61,7 @@ COPY --chown=node:node package.json ./
 
 # Mountpoint must exist so the container starts cleanly when no host mount is given.
 RUN mkdir -p /bundles && chown node:node /bundles
+RUN mkdir -p /home/node/.local/share/kubebuilder-envtest/k8s && chown -R node:node /home/node/
 
 USER node
 
