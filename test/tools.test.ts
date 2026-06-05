@@ -60,13 +60,27 @@ vi.mock("../src/kubectl.js", async () => {
 type ToolsModule = typeof import("../src/tools.js");
 let createServer: ToolsModule["createServer"];
 
+type RegisteredTool = {
+  inputSchema?: unknown;
+  callback?: (args: unknown, extra: unknown) => Promise<unknown>;
+  handler?: (args: unknown, extra: unknown) => Promise<unknown>;
+};
+
 const getRegisteredTool = (name: string) => {
   const server = createServer() as unknown as { _registeredTools: Record<string, unknown> };
-  const tool = server._registeredTools[name] as
-    | { inputSchema?: unknown; handler: (args: unknown, extra: unknown) => Promise<unknown> }
-    | undefined;
+  const tool = server._registeredTools[name] as RegisteredTool | undefined;
   if (!tool) throw new Error(`Missing tool '${name}'`);
   return tool;
+};
+
+const invokeTool = (tool: RegisteredTool, args: unknown, extra: unknown = {}) => {
+  const callback = typeof tool.callback === "function" ? tool.callback : undefined;
+  const handler = typeof tool.handler === "function" ? tool.handler : undefined;
+  const invoke = callback ?? handler;
+  if (!invoke) {
+    throw new Error("Tool has no callable callback/handler");
+  }
+  return invoke(args, extra);
 };
 
 beforeEach(async () => {
@@ -101,7 +115,8 @@ describe("kubectl_run tool schema + parsing", () => {
 
   it("filters kubectl output using grep and preserves parsing behavior", async () => {
     const kubectlRun = getRegisteredTool("kubectl_run");
-    const result = (await kubectlRun.handler(
+    const result = (await invokeTool(
+      kubectlRun,
       { args: "get pods -A", grep: "CrashLoopBackOff", grep_ignore_case: false },
       {},
     )) as { content: { text: string }[]; isError?: boolean };
@@ -113,7 +128,8 @@ describe("kubectl_run tool schema + parsing", () => {
 
   it("rejects invalid grep regex without calling external binaries", async () => {
     const kubectlRun = getRegisteredTool("kubectl_run");
-    const result = (await kubectlRun.handler(
+    const result = (await invokeTool(
+      kubectlRun,
       { args: "get pods -A", grep: "[" },
       {},
     )) as { content: { text: string }[]; isError?: boolean };
