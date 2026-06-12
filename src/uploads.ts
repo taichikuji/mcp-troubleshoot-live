@@ -31,10 +31,6 @@ export function posixShellQuote(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
-export function powershellQuote(s: string): string {
-  return `'${s.replace(/'/g, "''")}'`;
-}
-
 export function cmdQuote(s: string): string {
   return `"${s.replace(/"/g, "\"\"")}"`;
 }

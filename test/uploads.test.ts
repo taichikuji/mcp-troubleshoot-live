@@ -38,7 +38,6 @@ let maybeDeleteUpload: UploadsModule["maybeDeleteUpload"];
 let sweepUploads: UploadsModule["sweepUploads"];
 let uploadedPaths: UploadsModule["uploadedPaths"];
 let posixShellQuote: UploadsModule["posixShellQuote"];
-let powershellQuote: UploadsModule["powershellQuote"];
 let cmdQuote: UploadsModule["cmdQuote"];
 
 beforeEach(async () => {
@@ -55,7 +54,6 @@ beforeEach(async () => {
     sweepUploads,
     uploadedPaths,
     posixShellQuote,
-    powershellQuote,
     cmdQuote,
   } = await import("../src/uploads.js"));
   uploadedPaths.clear();
@@ -79,11 +77,6 @@ describe("shell-specific quoting", () => {
   it("quotes POSIX shell arguments safely", () => {
     expect(posixShellQuote("/tmp/a b/bundle.tar.gz")).toBe("'/tmp/a b/bundle.tar.gz'");
     expect(posixShellQuote("/tmp/O'Brien/bundle.tar.gz")).toBe("'/tmp/O'\\''Brien/bundle.tar.gz'");
-  });
-
-  it("quotes PowerShell arguments safely", () => {
-    expect(powershellQuote("C:\\Users\\Alice\\bundle.tar.gz")).toBe("'C:\\Users\\Alice\\bundle.tar.gz'");
-    expect(powershellQuote("C:\\Users\\O'Brien\\bundle.tar.gz")).toBe("'C:\\Users\\O''Brien\\bundle.tar.gz'");
   });
 
   it("quotes CMD arguments safely for double quotes", () => {

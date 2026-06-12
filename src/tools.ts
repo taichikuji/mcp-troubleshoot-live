@@ -27,12 +27,12 @@ import {
 import { READ_ONLY_VERBS, runKubectl, tokenize } from "./kubectl.js";
 import { errorResult, log, safeRun, textResult, type ToolResult } from "./log.js";
 import { uploadBaseUrl } from "./request-context.js";
-import { cmdQuote, listBundleFiles, posixShellQuote, powershellQuote, sanitizeFilename } from "./uploads.js";
+import { cmdQuote, listBundleFiles, posixShellQuote, sanitizeFilename } from "./uploads.js";
 
 const INSTRUCTIONS = [
   "WORKFLOW:",
   "1. Always call list_bundles first. If the bundle is present, go to step 3.",
-  "2. Bundle on user machine: prepare_upload → parse returned JSON → run matching OS/shell upload command on user machine → pass path to start_bundle.",
+  "2. Bundle on user machine: prepare_upload → parse returned JSON → run matching upload command (windows.shell/unix.sh) on user machine → pass returned path to start_bundle.",
   "3. start_bundle returns immediately. Poll cluster_status until status=ready. Do NOT inspect before then.",
   "4. First triage: cluster_overview (nodes, namespaces, not-ready pods, warnings — one call).",
   "5. All further queries: kubectl_run. Always pass --tail=N when fetching logs.",
@@ -74,7 +74,7 @@ export function createServer(): McpServer {
     "prepare_upload",
     {
       description:
-        "Use this when the user wants to investigate a support bundle that lives on their local machine and is not yet on the MCP server. BEFORE calling this, always call `list_bundles` first — the bundle may already be present, saving upload time. Returns strict one-line JSON containing upload commands for Windows (PowerShell/CMD), Linux, and macOS plus metadata. Parse the JSON, run the matching command via your shell tool, then pass the returned path/name to `start_bundle`.",
+        "Use this when the user wants to investigate a support bundle that lives on their local machine and is not yet on the MCP server. BEFORE calling this, always call `list_bundles` first — the bundle may already be present, saving upload time. Returns strict one-line JSON with one Windows shell command and one shared Unix shell command (Linux/macOS), plus URL and size/TTL limits. Parse the JSON, run the matching command via your shell tool, then pass the returned path/name to `start_bundle`.",
       inputSchema: {
         local_path: z
           .string()
@@ -94,29 +94,17 @@ export function createServer(): McpServer {
       }
       const url = `${uploadBaseUrl().replace(/\/+$/, "")}/bundles/upload/${encodeURIComponent(safe)}`;
       const payload = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         commands: {
           windows: {
-            ps:
-              `Invoke-WebRequest -Method Put -InFile ${powershellQuote(local_path)} ` +
-              `-Uri ${powershellQuote(url)} -UseBasicParsing`,
-            cmd: `curl -fsS --upload-file ${cmdQuote(local_path)} ${cmdQuote(url)}`,
+            shell: `curl.exe -fsS --upload-file ${cmdQuote(local_path)} ${cmdQuote(url)}`,
           },
-          linux: {
-            sh: `curl -fsS --upload-file ${posixShellQuote(local_path)} ${posixShellQuote(url)}`,
-          },
-          macos: {
+          unix: {
             sh: `curl -fsS --upload-file ${posixShellQuote(local_path)} ${posixShellQuote(url)}`,
           },
         },
         uploadUrl: url,
-        expectedResponse: {
-          path: `${UPLOAD_DIR}/<uuid>-${safe}`,
-          name: `<uuid>-${safe}`,
-          sizeBytes: "number",
-        },
-        maxSizeBytes: MAX_UPLOAD_BYTES,
-        ttlMs: UPLOAD_TTL_MS,
+        limits: { maxSizeBytes: MAX_UPLOAD_BYTES, ttlMs: UPLOAD_TTL_MS },
       };
       return textResult(JSON.stringify(payload));
     }),

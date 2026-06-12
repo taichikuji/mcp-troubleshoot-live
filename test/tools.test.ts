@@ -147,7 +147,7 @@ describe("kubectl_run tool schema + parsing", () => {
 });
 
 describe("prepare_upload tool output contract", () => {
-  it("returns strict one-line JSON with per-OS commands and metadata", async () => {
+  it("returns strict one-line JSON with one windows command and one unix command", async () => {
     const prepareUpload = getRegisteredTool("prepare_upload");
     const result = (await invokeTool(
       prepareUpload,
@@ -162,27 +162,20 @@ describe("prepare_upload tool output contract", () => {
     const payload = JSON.parse(text) as {
       schemaVersion: number;
       commands: {
-        windows: { ps: string; cmd: string };
-        linux: { sh: string };
-        macos: { sh: string };
+        windows: { shell: string };
+        unix: { sh: string };
       };
       uploadUrl: string;
-      expectedResponse: { path: string; name: string; sizeBytes: string };
-      maxSizeBytes: number;
-      ttlMs: number;
+      limits: { maxSizeBytes: number; ttlMs: number };
     };
 
-    expect(payload.schemaVersion).toBe(1);
+    expect(payload.schemaVersion).toBe(2);
     expect(payload.uploadUrl).toBe("https://mcp.example.test/bundles/upload/bundle.tar.gz");
-    expect(payload.commands.windows.ps).toContain("-InFile '/Users/alice/Local O''Brien/bundle.tar.gz'");
-    expect(payload.commands.windows.cmd).toContain("--upload-file \"/Users/alice/Local O'Brien/bundle.tar.gz\"");
-    expect(payload.commands.linux.sh).toContain("--upload-file '/Users/alice/Local O'\\''Brien/bundle.tar.gz'");
-    expect(payload.commands.macos.sh).toBe(payload.commands.linux.sh);
-    expect(payload.expectedResponse.path).toBe("/mock/uploads/<uuid>-bundle.tar.gz");
-    expect(payload.expectedResponse.name).toBe("<uuid>-bundle.tar.gz");
-    expect(payload.expectedResponse.sizeBytes).toBe("number");
-    expect(payload.maxSizeBytes).toBe(1024);
-    expect(payload.ttlMs).toBe(60_000);
+    expect(payload.commands.windows.shell).toContain("curl.exe -fsS --upload-file");
+    expect(payload.commands.windows.shell).toContain("--upload-file \"/Users/alice/Local O'Brien/bundle.tar.gz\"");
+    expect(payload.commands.unix.sh).toContain("--upload-file '/Users/alice/Local O'\\''Brien/bundle.tar.gz'");
+    expect(payload.limits.maxSizeBytes).toBe(1024);
+    expect(payload.limits.ttlMs).toBe(60_000);
   });
 
   it("returns a validation error for unsafe bundle filenames", async () => {
