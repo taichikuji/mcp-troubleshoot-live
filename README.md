@@ -44,8 +44,14 @@ If you're running on a different host, swap `localhost` for the host's IP.
 
 Two ways:
 
-1. **Upload directly** (default) — tell the AI: *"investigate `~/Downloads/bundle.tar.gz`"*. It uses `prepare_upload` to push the file over.
+1. **Upload directly** (default) — tell the AI: *"investigate `~/Downloads/bundle.tar.gz`"*. It calls `prepare_upload`, which now returns a one-line JSON payload with per-OS upload commands (`windows.ps`, `windows.cmd`, `linux.sh`, `macos.sh`) plus metadata (`uploadUrl`, expected response shape, size/TTL limits). The AI picks the command matching the active shell/OS and runs it.
 2. **Shared folder** — if your MCP host and machine share a filesystem (Docker bind-mount, UTM share, etc.), drop the bundle in `/bundles`. The AI finds it with `list_bundles`.
+
+`prepare_upload` response contract (compact JSON):
+
+```json
+{"schemaVersion":1,"commands":{"windows":{"ps":"...","cmd":"..."},"linux":{"sh":"..."},"macos":{"sh":"..."}},"uploadUrl":"http://host/bundles/upload/file.tar.gz","expectedResponse":{"path":"/tmp/troubleshoot-mcp-uploads/<uuid>-file.tar.gz","name":"<uuid>-file.tar.gz","sizeBytes":"number"},"maxSizeBytes":5368709120,"ttlMs":21600000}
+```
 
 ## What can I ask?
 

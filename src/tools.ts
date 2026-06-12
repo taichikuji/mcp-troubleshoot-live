@@ -27,12 +27,12 @@ import {
 import { READ_ONLY_VERBS, runKubectl, tokenize } from "./kubectl.js";
 import { errorResult, log, safeRun, textResult, type ToolResult } from "./log.js";
 import { uploadBaseUrl } from "./request-context.js";
-import { listBundleFiles, sanitizeFilename, shellQuote } from "./uploads.js";
+import { cmdQuote, listBundleFiles, posixShellQuote, powershellQuote, sanitizeFilename } from "./uploads.js";
 
 const INSTRUCTIONS = [
   "WORKFLOW:",
   "1. Always call list_bundles first. If the bundle is present, go to step 3.",
-  "2. Bundle on user machine: prepare_upload → run returned curl on user machine → pass path to start_bundle.",
+  "2. Bundle on user machine: prepare_upload → parse returned JSON → run matching OS/shell upload command on user machine → pass path to start_bundle.",
   "3. start_bundle returns immediately. Poll cluster_status until status=ready. Do NOT inspect before then.",
   "4. First triage: cluster_overview (nodes, namespaces, not-ready pods, warnings — one call).",
   "5. All further queries: kubectl_run. Always pass --tail=N when fetching logs.",
@@ -74,7 +74,7 @@ export function createServer(): McpServer {
     "prepare_upload",
     {
       description:
-        "Use this when the user wants to investigate a support bundle that lives on their local machine and is not yet on the MCP server. BEFORE calling this, always call `list_bundles` first — the bundle may already be present, saving upload time. Returns a `curl` command to push the bundle from the user's machine to the MCP server's upload endpoint. Run that curl via your shell tool, then pass the returned path/name to `start_bundle`.",
+        "Use this when the user wants to investigate a support bundle that lives on their local machine and is not yet on the MCP server. BEFORE calling this, always call `list_bundles` first — the bundle may already be present, saving upload time. Returns strict one-line JSON containing upload commands for Windows (PowerShell/CMD), Linux, and macOS plus metadata. Parse the JSON, run the matching command via your shell tool, then pass the returned path/name to `start_bundle`.",
       inputSchema: {
         local_path: z
           .string()
@@ -93,21 +93,32 @@ export function createServer(): McpServer {
         );
       }
       const url = `${uploadBaseUrl().replace(/\/+$/, "")}/bundles/upload/${encodeURIComponent(safe)}`;
-      const cmd = `curl -fsS --upload-file ${shellQuote(local_path)} ${shellQuote(url)}`;
-      const ttlH = Math.round(UPLOAD_TTL_MS / 3_600_000);
-      const maxGb = (MAX_UPLOAD_BYTES / (1024 * 1024 * 1024)).toFixed(1);
-      return textResult([
-        "Run this exact command on the user's machine via your shell tool:",
-        "",
-        cmd,
-        "",
-        "It will print a JSON response shaped like:",
-        `  { "path": "${UPLOAD_DIR}/<uuid>-${safe}", "name": "<uuid>-${safe}", "sizeBytes": N }`,
-        "",
-        `Then call start_bundle with bundle_path set to that "path" (or "name"). The`,
-        `uploaded file is auto-deleted when stop_bundle runs, when this container`,
-        `restarts, or after ${ttlH}h of inactivity. Max upload size: ${maxGb} GB.`,
-      ].join("\n"));
+      const payload = {
+        schemaVersion: 1,
+        commands: {
+          windows: {
+            ps:
+              `Invoke-WebRequest -Method Put -InFile ${powershellQuote(local_path)} ` +
+              `-Uri ${powershellQuote(url)} -UseBasicParsing`,
+            cmd: `curl -fsS --upload-file ${cmdQuote(local_path)} ${cmdQuote(url)}`,
+          },
+          linux: {
+            sh: `curl -fsS --upload-file ${posixShellQuote(local_path)} ${posixShellQuote(url)}`,
+          },
+          macos: {
+            sh: `curl -fsS --upload-file ${posixShellQuote(local_path)} ${posixShellQuote(url)}`,
+          },
+        },
+        uploadUrl: url,
+        expectedResponse: {
+          path: `${UPLOAD_DIR}/<uuid>-${safe}`,
+          name: `<uuid>-${safe}`,
+          sizeBytes: "number",
+        },
+        maxSizeBytes: MAX_UPLOAD_BYTES,
+        ttlMs: UPLOAD_TTL_MS,
+      };
+      return textResult(JSON.stringify(payload));
     }),
   );
 
@@ -138,7 +149,7 @@ export function createServer(): McpServer {
           "",
           "Next steps:",
           `  - If the bundle is on the user's local machine, call prepare_upload first`,
-          `    (returns a curl command that uploads it to ${UPLOAD_DIR}).`,
+          `    (returns JSON with OS-specific upload commands targeting ${UPLOAD_DIR}).`,
           `  - If the bundle should already be on the server, call list_bundles to see`,
           `    what's actually available in ${BUNDLES_DIR}.`,
         ].join("\n"));

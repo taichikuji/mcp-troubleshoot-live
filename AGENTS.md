@@ -113,3 +113,19 @@ mkdir -p ~/.local/node && cd ~/.local/node \
   && tar -xJf node.tar.xz --strip-components=1 && rm node.tar.xz
 export PATH="$HOME/.local/node/bin:$PATH"
 ```
+
+---
+
+# Context Glossary
+
+## ClientMachine
+The machine where the operator and AI client run, and where a local support bundle may originate before transfer.
+
+## McpHost
+The machine running this MCP server process and exposing its HTTP endpoints.
+
+## BundleLibrary
+A durable bundle catalog on the `McpHost`, mapped to `/bundles`, containing support bundles available for direct loading.
+
+## UploadStaging
+A temporary staging area on the `McpHost`, mapped to `UPLOAD_DIR`, where uploaded bundles are stored before load and cleanup.

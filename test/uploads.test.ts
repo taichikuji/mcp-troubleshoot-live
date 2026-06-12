@@ -37,6 +37,9 @@ let sanitizeFilename: UploadsModule["sanitizeFilename"];
 let maybeDeleteUpload: UploadsModule["maybeDeleteUpload"];
 let sweepUploads: UploadsModule["sweepUploads"];
 let uploadedPaths: UploadsModule["uploadedPaths"];
+let posixShellQuote: UploadsModule["posixShellQuote"];
+let powershellQuote: UploadsModule["powershellQuote"];
+let cmdQuote: UploadsModule["cmdQuote"];
 
 beforeEach(async () => {
   vi.useRealTimers();
@@ -46,7 +49,15 @@ beforeEach(async () => {
   mocks.existsSync.mockReturnValue(true);
   mocks.readdirSync.mockReturnValue([]);
 
-  ({ sanitizeFilename, maybeDeleteUpload, sweepUploads, uploadedPaths } = await import("../src/uploads.js"));
+  ({
+    sanitizeFilename,
+    maybeDeleteUpload,
+    sweepUploads,
+    uploadedPaths,
+    posixShellQuote,
+    powershellQuote,
+    cmdQuote,
+  } = await import("../src/uploads.js"));
   uploadedPaths.clear();
 });
 
@@ -61,6 +72,23 @@ describe("sanitizeFilename", () => {
     expect(sanitizeFilename("../file")).toBeNull();
     expect(sanitizeFilename("bundle.zip")).toBeNull();
     expect(sanitizeFilename(".hidden.tar.gz")).toBeNull();
+  });
+});
+
+describe("shell-specific quoting", () => {
+  it("quotes POSIX shell arguments safely", () => {
+    expect(posixShellQuote("/tmp/a b/bundle.tar.gz")).toBe("'/tmp/a b/bundle.tar.gz'");
+    expect(posixShellQuote("/tmp/O'Brien/bundle.tar.gz")).toBe("'/tmp/O'\\''Brien/bundle.tar.gz'");
+  });
+
+  it("quotes PowerShell arguments safely", () => {
+    expect(powershellQuote("C:\\Users\\Alice\\bundle.tar.gz")).toBe("'C:\\Users\\Alice\\bundle.tar.gz'");
+    expect(powershellQuote("C:\\Users\\O'Brien\\bundle.tar.gz")).toBe("'C:\\Users\\O''Brien\\bundle.tar.gz'");
+  });
+
+  it("quotes CMD arguments safely for double quotes", () => {
+    expect(cmdQuote("C:\\Users\\Alice\\bundle.tar.gz")).toBe("\"C:\\Users\\Alice\\bundle.tar.gz\"");
+    expect(cmdQuote("C:\\temp\\x\"y\\bundle.tar.gz")).toBe("\"C:\\temp\\x\"\"y\\bundle.tar.gz\"");
   });
 });
 

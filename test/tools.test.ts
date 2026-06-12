@@ -44,9 +44,15 @@ vi.mock("../src/bundle.js", () => ({
 vi.mock("../src/config.js", () => ({
   BUNDLES_DIR: "/mock/bundles",
   MAX_UPLOAD_BYTES: 1024,
+  PORT: 3000,
+  PUBLIC_URL_OVERRIDE: null,
   PROXY_ADDRESS: "127.0.0.1:8443",
   UPLOAD_DIR: "/mock/uploads",
   UPLOAD_TTL_MS: 60_000,
+}));
+
+vi.mock("../src/request-context.js", () => ({
+  uploadBaseUrl: () => "https://mcp.example.test",
 }));
 
 vi.mock("../src/kubectl.js", async () => {
@@ -137,5 +143,57 @@ describe("kubectl_run tool schema + parsing", () => {
     expect(result.isError).toBe(true);
     expect(result.content[0]?.text).toContain("Invalid grep pattern");
     expect(mocks.runKubectl).toHaveBeenCalledWith(["get", "pods", "-A"]);
+  });
+});
+
+describe("prepare_upload tool output contract", () => {
+  it("returns strict one-line JSON with per-OS commands and metadata", async () => {
+    const prepareUpload = getRegisteredTool("prepare_upload");
+    const result = (await invokeTool(
+      prepareUpload,
+      { local_path: "/Users/alice/Local O'Brien/bundle.tar.gz" },
+      {},
+    )) as { content: { text: string }[]; isError?: boolean };
+
+    expect(result.isError).toBeUndefined();
+    const text = result.content[0]?.text ?? "";
+    expect(text.includes("\n")).toBe(false);
+
+    const payload = JSON.parse(text) as {
+      schemaVersion: number;
+      commands: {
+        windows: { ps: string; cmd: string };
+        linux: { sh: string };
+        macos: { sh: string };
+      };
+      uploadUrl: string;
+      expectedResponse: { path: string; name: string; sizeBytes: string };
+      maxSizeBytes: number;
+      ttlMs: number;
+    };
+
+    expect(payload.schemaVersion).toBe(1);
+    expect(payload.uploadUrl).toBe("https://mcp.example.test/bundles/upload/bundle.tar.gz");
+    expect(payload.commands.windows.ps).toContain("-InFile '/Users/alice/Local O''Brien/bundle.tar.gz'");
+    expect(payload.commands.windows.cmd).toContain("--upload-file \"/Users/alice/Local O'Brien/bundle.tar.gz\"");
+    expect(payload.commands.linux.sh).toContain("--upload-file '/Users/alice/Local O'\\''Brien/bundle.tar.gz'");
+    expect(payload.commands.macos.sh).toBe(payload.commands.linux.sh);
+    expect(payload.expectedResponse.path).toBe("/mock/uploads/<uuid>-bundle.tar.gz");
+    expect(payload.expectedResponse.name).toBe("<uuid>-bundle.tar.gz");
+    expect(payload.expectedResponse.sizeBytes).toBe("number");
+    expect(payload.maxSizeBytes).toBe(1024);
+    expect(payload.ttlMs).toBe(60_000);
+  });
+
+  it("returns a validation error for unsafe bundle filenames", async () => {
+    const prepareUpload = getRegisteredTool("prepare_upload");
+    const result = (await invokeTool(
+      prepareUpload,
+      { local_path: "/Users/alice/bundle with spaces.tar.gz" },
+      {},
+    )) as { content: { text: string }[]; isError?: boolean };
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain("Cannot derive a safe filename");
   });
 });

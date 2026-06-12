@@ -27,8 +27,16 @@ export function sanitizeFilename(raw: string): string | null {
   return base;
 }
 
-export function shellQuote(s: string): string {
+export function posixShellQuote(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+export function powershellQuote(s: string): string {
+  return `'${s.replace(/'/g, "''")}'`;
+}
+
+export function cmdQuote(s: string): string {
+  return `"${s.replace(/"/g, "\"\"")}"`;
 }
 
 export function initUploadDir(): void {
