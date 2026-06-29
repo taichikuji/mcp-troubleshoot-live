@@ -6,8 +6,8 @@ FROM debian:bookworm-slim AS tools
 # errexit + pipefail so failures inside `curl ... | tar -xz` abort the build.
 SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 
-ARG KUBECTL_VERSION=v1.36.1
-ARG TROUBLESHOOT_LIVE_VERSION=v0.2.0
+ARG KUBECTL_VERSION=v1.36.2
+ARG TROUBLESHOOT_LIVE_VERSION=v0.2.1
 
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
