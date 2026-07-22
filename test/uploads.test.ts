@@ -36,7 +36,6 @@ type UploadsModule = typeof import("../src/uploads.js");
 let sanitizeFilename: UploadsModule["sanitizeFilename"];
 let maybeDeleteUpload: UploadsModule["maybeDeleteUpload"];
 let sweepUploads: UploadsModule["sweepUploads"];
-let uploadedPaths: UploadsModule["uploadedPaths"];
 let posixShellQuote: UploadsModule["posixShellQuote"];
 let cmdQuote: UploadsModule["cmdQuote"];
 
@@ -52,11 +51,9 @@ beforeEach(async () => {
     sanitizeFilename,
     maybeDeleteUpload,
     sweepUploads,
-    uploadedPaths,
     posixShellQuote,
     cmdQuote,
   } = await import("../src/uploads.js"));
-  uploadedPaths.clear();
 });
 
 describe("sanitizeFilename", () => {
@@ -86,21 +83,16 @@ describe("shell-specific quoting", () => {
 });
 
 describe("maybeDeleteUpload", () => {
-  it("deletes and forgets uploaded paths tracked in uploadedPaths", () => {
-    const tracked = "/mock/uploads/u-1.tar.gz";
-    uploadedPaths.add(tracked);
+  it("deletes paths under the upload directory", () => {
+    maybeDeleteUpload("/mock/uploads/u-1.tar.gz");
 
-    maybeDeleteUpload(tracked);
-
-    expect(mocks.unlinkSync).toHaveBeenCalledWith(tracked);
-    expect(uploadedPaths.has(tracked)).toBe(false);
+    expect(mocks.unlinkSync).toHaveBeenCalledWith("/mock/uploads/u-1.tar.gz");
   });
 
-  it("ignores untracked paths", () => {
-    maybeDeleteUpload("/mock/uploads/not-tracked.tar.gz");
+  it("ignores paths outside the upload directory", () => {
+    maybeDeleteUpload("/mock/bundles/not-an-upload.tar.gz");
 
     expect(mocks.unlinkSync).not.toHaveBeenCalled();
-    expect(uploadedPaths.size).toBe(0);
   });
 });
 
@@ -122,16 +114,9 @@ describe("sweepUploads", () => {
       return { isFile: () => false, mtimeMs: now };
     });
 
-    uploadedPaths.add(stale);
-    uploadedPaths.add(fresh);
-    uploadedPaths.add(current);
-
     sweepUploads(current);
 
     expect(mocks.unlinkSync).toHaveBeenCalledTimes(1);
     expect(mocks.unlinkSync).toHaveBeenCalledWith(stale);
-    expect(uploadedPaths.has(stale)).toBe(false);
-    expect(uploadedPaths.has(fresh)).toBe(true);
-    expect(uploadedPaths.has(current)).toBe(true);
   });
 });

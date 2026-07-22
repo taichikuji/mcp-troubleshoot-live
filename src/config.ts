@@ -6,7 +6,6 @@ const intEnv = (name: string, def: number): number => {
 };
 
 export const KUBECONFIG_PATH = process.env.KUBECONFIG_PATH ?? "/tmp/kubeconfig";
-export const BUNDLE_PATH = process.env.BUNDLE_PATH;
 export const BUNDLES_DIR = process.env.BUNDLES_DIR ?? "/bundles";
 export const PORT = intEnv("PORT", 3000);
 export const PROXY_ADDRESS = process.env.PROXY_ADDRESS ?? "localhost:8080";
@@ -23,7 +22,6 @@ export const UPLOAD_SWEEP_INTERVAL_MS = intEnv("UPLOAD_SWEEP_INTERVAL_MS", 30 * 
 // Normally derived per-request from Host + X-Forwarded-*; set this to pin it.
 export const PUBLIC_URL_OVERRIDE = (process.env.PUBLIC_URL ?? "").trim() || null;
 
-export const KUBECTL_CACHE_TTL_MS = intEnv("KUBECTL_CACHE_TTL_MS", 300_000);
 export const KUBECTL_CACHE_MAX_ENTRIES = intEnv("KUBECTL_CACHE_MAX_ENTRIES", 256);
 
 // Responses over this size get a "narrow your query" hint appended; nothing is truncated.

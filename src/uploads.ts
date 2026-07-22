@@ -8,15 +8,12 @@ import {
   statSync,
   unlinkSync,
 } from "fs";
-import { join } from "path";
+import { join, resolve, sep } from "path";
 
 import type { Request, Response } from "express";
 
 import { BUNDLES_DIR, MAX_UPLOAD_BYTES, UPLOAD_DIR, UPLOAD_TTL_MS } from "./config.js";
 import { log } from "./log.js";
-
-// Files owned via the upload endpoint; /bundles paths are never in here.
-export const uploadedPaths = new Set<string>();
 
 export function sanitizeFilename(raw: string): string | null {
   const base = raw.replace(/^.*[\\/]/, "");
@@ -52,7 +49,6 @@ export function sweepUploads(currentBundlePath: string | null): void {
       if (!s.isFile()) continue;
       if (now - s.mtimeMs > UPLOAD_TTL_MS) {
         unlinkSync(full);
-        uploadedPaths.delete(full);
         log(`[MCP] Reaped idle upload: ${full}`);
       }
     } catch {}
@@ -60,12 +56,11 @@ export function sweepUploads(currentBundlePath: string | null): void {
 }
 
 export function maybeDeleteUpload(p: string | null): void {
-  if (!p || !uploadedPaths.has(p)) return;
+  if (!p || !resolve(p).startsWith(`${resolve(UPLOAD_DIR)}${sep}`)) return;
   try {
     unlinkSync(p);
     log(`[MCP] Deleted uploaded bundle after stop: ${p}`);
   } catch {}
-  uploadedPaths.delete(p);
 }
 
 export type BundleFile = {
@@ -78,23 +73,14 @@ export type BundleFile = {
 export function listBundleFiles(): BundleFile[] {
   if (!existsSync(BUNDLES_DIR)) return [];
   const out: BundleFile[] = [];
-  const walk = (dir: string) => {
-    for (const entry of readdirSync(dir)) {
-      const full = join(dir, entry);
-      let s;
-      try {
-        s = statSync(full);
-      } catch {
-        continue;
-      }
-      if (s.isDirectory()) {
-        walk(full);
-      } else if (s.isFile() && /\.(tar\.gz|tgz|tar)$/i.test(entry)) {
-        out.push({ path: full, name: entry, sizeBytes: s.size, modified: s.mtime.toISOString() });
-      }
-    }
-  };
-  walk(BUNDLES_DIR);
+  for (const entry of readdirSync(BUNDLES_DIR, { recursive: true, withFileTypes: true })) {
+    if (!entry.isFile() || !/\.(tar\.gz|tgz|tar)$/i.test(entry.name)) continue;
+    const full = join(entry.parentPath, entry.name);
+    try {
+      const s = statSync(full);
+      out.push({ path: full, name: entry.name, sizeBytes: s.size, modified: s.mtime.toISOString() });
+    } catch {}
+  }
   return out.sort((a, b) => b.modified.localeCompare(a.modified));
 }
 
@@ -147,7 +133,6 @@ export function handleUpload(req: Request, res: Response): void {
   ws.on("error", (err) => abort(500, err.message));
   ws.on("finish", () => {
     if (aborted) return;
-    uploadedPaths.add(dest);
     log(`[MCP] Received upload: ${dest} (${bytes} bytes)`);
     res.status(201).json({ path: dest, name: `${id}-${safe}`, sizeBytes: bytes });
   });

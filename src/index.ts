@@ -1,4 +1,4 @@
-import { existsSync, rmSync } from "fs";
+import { rmSync } from "fs";
 
 import express, { type Request, type Response } from "express";
 
@@ -7,17 +7,13 @@ import {
   bundleLoading,
   bundleReady,
   currentBundlePath,
-  markReady,
-  startBundle,
   stopBundle,
-  waitForCluster,
 } from "./bundle.js";
 import {
   BUNDLES_DIR,
-  BUNDLE_PATH,
+  CLUSTER_READY_TIMEOUT_MS,
   KUBECONFIG_PATH,
   KUBECTL_CACHE_MAX_ENTRIES,
-  KUBECTL_CACHE_TTL_MS,
   MAX_UPLOAD_BYTES,
   PORT,
   PUBLIC_URL_OVERRIDE,
@@ -47,7 +43,6 @@ app.get("/health", (_req: Request, res: Response) => {
     bundlesDir: BUNDLES_DIR,
     uploadDir: UPLOAD_DIR,
     kubeconfig: KUBECONFIG_PATH,
-    autoStartBundle: BUNDLE_PATH ?? null,
   });
 });
 
@@ -63,32 +58,14 @@ async function main(): Promise<void> {
       ? `[MCP] Upload base URL pinned via PUBLIC_URL=${PUBLIC_URL_OVERRIDE}`
       : `[MCP] Upload base URL: auto-detected from each MCP request's Host header (set PUBLIC_URL to override)`,
   );
+  log(`[MCP] kubectl cache: max ${KUBECTL_CACHE_MAX_ENTRIES} entries (cleared on bundle switch)`);
   log(
-    KUBECTL_CACHE_TTL_MS > 0
-      ? `[MCP] kubectl cache: TTL ${Math.round(KUBECTL_CACHE_TTL_MS / 1000)}s, max ${KUBECTL_CACHE_MAX_ENTRIES} entries (cleared on bundle switch)`
-      : `[MCP] kubectl cache: disabled (KUBECTL_CACHE_TTL_MS=0)`,
+    `[MCP] Bundle load timeout: ${Math.round(CLUSTER_READY_TIMEOUT_MS / 1000)}s ` +
+      "(timed-out child processes are stopped)",
   );
 
   const sweepTimer = setInterval(() => sweepUploads(currentBundlePath), UPLOAD_SWEEP_INTERVAL_MS);
   sweepTimer.unref();
-
-  if (BUNDLE_PATH) {
-    if (!existsSync(BUNDLE_PATH)) {
-      log(`[MCP] BUNDLE_PATH is set to "${BUNDLE_PATH}" but the file was not found.`);
-      log("[MCP] Starting MCP server anyway — use the start_bundle tool to load a bundle.");
-    } else {
-      try {
-        await startBundle(BUNDLE_PATH);
-        log("[MCP] Waiting for Kubernetes API to become ready…");
-        const ok = await waitForCluster();
-        markReady(ok, BUNDLE_PATH);
-        log(ok ? "[MCP] Kubernetes API is ready." : "[MCP] Warning: Kubernetes API did not become ready in time.");
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        log(`[MCP] Failed to auto-start bundle: ${msg}`);
-      }
-    }
-  }
 
   const httpServer = app.listen(PORT, () => {
     log(`[MCP] Server listening on port ${PORT}`);

@@ -19,6 +19,9 @@ export let bundleReady = false;
 export let bundleLoading = false;
 export let bundleLoadError: string | null = null;
 export let currentBundlePath: string | null = null;
+export let currentBundleGeneration = 0;
+export let bundleLoadStartedAt: number | null = null;
+export let bundlePhaseStartedAt: number | null = null;
 export type BundlePhase =
   | "idle"
   | "spawning"
@@ -29,6 +32,8 @@ export type BundlePhase =
 export let bundlePhase: BundlePhase = "idle";
 
 let bundleProcess: ChildProcess | null = null;
+let recentProcessOutput: string[] = [];
+const MAX_OUTPUT_LINES = 100;
 
 // Ready signal driven off troubleshoot-live's stderr. Reset per start.
 type Deferred<T> = { promise: Promise<T>; resolve: (value: T) => void };
@@ -72,22 +77,32 @@ function observePhase(line: string): void {
     return;
   }
   if (line.includes("Importing bundle resources")) {
-    bundlePhase = "importing";
+    setPhase("importing");
   } else if (line.includes("Starting k8s server")) {
-    bundlePhase = "starting_apiserver";
+    setPhase("starting_apiserver");
   }
 }
 
-export async function startBundle(bundlePath: string): Promise<void> {
+function setPhase(phase: BundlePhase): void {
+  if (bundlePhase === phase) return;
+  bundlePhase = phase;
+  bundlePhaseStartedAt = Date.now();
+}
+
+export async function startBundle(bundlePath: string): Promise<number> {
   return new Promise((resolve, reject) => {
     log(`[MCP] Starting troubleshoot-live with bundle: ${bundlePath}`);
     cacheClear();
     readySignal = deferred<boolean>();
+    recentProcessOutput = [];
+    const generation = ++currentBundleGeneration;
+    bundleLoadStartedAt = Date.now();
+    bundlePhaseStartedAt = bundleLoadStartedAt;
 
     const child = spawn(
       "troubleshoot-live",
       ["serve", bundlePath, "--output-kubeconfig", KUBECONFIG_PATH, "--proxy-address", PROXY_ADDRESS],
-      { stdio: ["ignore", "pipe", "pipe"] },
+      { stdio: ["ignore", "pipe", "pipe"], detached: true },
     );
     bundleProcess = child;
     currentBundlePath = bundlePath;
@@ -100,15 +115,13 @@ export async function startBundle(bundlePath: string): Promise<void> {
     };
 
     // Keep recent stderr/stdout so an early-exit error message is useful.
-    const outputLines: string[] = [];
-    const MAX_OUTPUT_LINES = 100;
     const captureLine = (prefix: string, d: Buffer) => {
       process.stderr.write(`[troubleshoot-live] ${d}`);
       for (const line of d.toString().split("\n")) {
         const content = line.trimEnd();
         if (content.length === 0) continue;
-        outputLines.push(`${prefix}: ${content}`);
-        if (outputLines.length > MAX_OUTPUT_LINES) outputLines.shift();
+        recentProcessOutput.push(`${prefix}: ${content}`);
+        if (recentProcessOutput.length > MAX_OUTPUT_LINES) recentProcessOutput.shift();
         if (prefix === "stderr") observePhase(content);
       }
     };
@@ -117,11 +130,11 @@ export async function startBundle(bundlePath: string): Promise<void> {
     child.stderr?.on("data", (d: Buffer) => captureLine("stderr", d));
 
     // 'spawn' fires only on successful exec; 'error' fires on missing binary.
-    child.once("spawn", () => settle(() => resolve()));
+    child.once("spawn", () => settle(() => resolve(generation)));
     child.on("error", (err) => {
       bundleLoading = false;
       bundleLoadError = err.message;
-      bundlePhase = "failed";
+      setPhase("failed");
       readySignal.resolve(false);
       settle(() => reject(err));
     });
@@ -132,14 +145,14 @@ export async function startBundle(bundlePath: string): Promise<void> {
       try { rmSync(TROUBLESHOOT_LIVE_WORKDIR, { recursive: true, force: true }); } catch {}
       const reason = signal ? `signal ${signal}` : `code ${code}`;
       log(`[MCP] troubleshoot-live exited with ${reason}`);
-      const output = outputLines.join("\n").trim();
+      const output = recentProcessOutput.join("\n").trim();
       const detail = output ? `\n\nProcess output:\n${output}` : "";
       const msg = `troubleshoot-live exited before becoming ready (${reason})${detail}`;
       if (bundleLoading) {
         bundleLoading = false;
         bundleLoadError = msg;
       }
-      bundlePhase = "failed";
+      setPhase("failed");
       readySignal.resolve(false);
       settle(() => reject(new Error(msg)));
     });
@@ -164,6 +177,8 @@ export async function stopBundle(timeoutMs = 10_000): Promise<void> {
       bundleProcess = null;
       currentBundlePath = null;
       bundlePhase = "idle";
+      bundleLoadStartedAt = null;
+      bundlePhaseStartedAt = null;
       cacheClear();
       try { if (existsSync(KUBECONFIG_PATH)) unlinkSync(KUBECONFIG_PATH); } catch {}
       try { rmSync(TROUBLESHOOT_LIVE_WORKDIR, { recursive: true, force: true }); } catch {}
@@ -171,10 +186,21 @@ export async function stopBundle(timeoutMs = 10_000): Promise<void> {
       resolve();
     };
 
+    const signalProcessGroup = (signal: NodeJS.Signals) => {
+      try {
+        if (child.pid !== undefined) {
+          process.kill(-child.pid, signal);
+          return;
+        }
+      } catch {}
+      child.kill(signal);
+    };
+
     child.once("exit", finish);
-    child.kill("SIGTERM");
+    // troubleshoot-live handles SIGINT and then stops kube-apiserver + etcd.
+    signalProcessGroup("SIGINT");
     const killTimer = setTimeout(() => {
-      if (!child.killed) child.kill("SIGKILL");
+      if (!done) signalProcessGroup("SIGKILL");
     }, 5_000);
     killTimer.unref();
     const giveUp = setTimeout(finish, timeoutMs);
@@ -186,26 +212,50 @@ export function markLoading(): void {
   bundleReady = false;
   bundleLoading = true;
   bundleLoadError = null;
-  bundlePhase = "spawning";
+  setPhase("spawning");
 }
 
-export function markReady(ok: boolean, expectedPath: string): void {
+export function markReady(expectedPath: string, expectedGeneration: number): void {
   // A newer start_bundle/stop_bundle may have superseded this one.
-  if (currentBundlePath !== expectedPath) return;
-  bundleReady = ok;
+  if (currentBundlePath !== expectedPath || currentBundleGeneration !== expectedGeneration) return;
+  bundleReady = true;
   bundleLoading = false;
-  bundlePhase = ok ? "ready" : "failed";
-  if (!ok && !bundleLoadError) {
-    bundleLoadError = `Kubernetes API did not become ready within ${Math.round(
-      CLUSTER_READY_TIMEOUT_MS / 1000,
-    )}s.`;
-  }
+  setPhase("ready");
 }
 
 export function markFailed(msg: string): void {
   bundleLoading = false;
   bundleLoadError = msg;
-  bundlePhase = "failed";
+  setPhase("failed");
+}
+
+export async function abortTimedOutBundle(
+  expectedPath: string,
+  expectedGeneration: number,
+): Promise<void> {
+  if (
+    currentBundlePath !== expectedPath ||
+    currentBundleGeneration !== expectedGeneration
+  ) return;
+
+  const elapsedSeconds = bundleLoadStartedAt === null
+    ? Math.round(CLUSTER_READY_TIMEOUT_MS / 1000)
+    : Math.round((Date.now() - bundleLoadStartedAt) / 1000);
+  const output = recentProcessOutput.join("\n").trim();
+  const detail = output ? `\n\nRecent process output:\n${output}` : "";
+  const msg =
+    `Bundle import timed out after ${elapsedSeconds}s in phase=${bundlePhase}. ` +
+    `The troubleshoot-live process was stopped to protect the host. Do not retry the same ` +
+    `bundle automatically.${detail}`;
+
+  await stopBundle();
+  if (
+    bundleProcess === null &&
+    currentBundlePath === null &&
+    currentBundleGeneration === expectedGeneration
+  ) {
+    markFailed(msg);
+  }
 }
 
 // Null when ready; otherwise a tool result describing why it isn't.
@@ -218,7 +268,7 @@ export function requireReady(): ToolResult | null {
   }
   if (bundleLoadError) {
     return errorResult(
-      `Last bundle load failed:\n${bundleLoadError}\nCall start_bundle again or pick a different bundle.`,
+      `Last bundle load failed:\n${bundleLoadError}\nDo not retry the same bundle automatically.`,
     );
   }
   return errorResult(

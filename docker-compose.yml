@@ -8,11 +8,11 @@ services:
       # App always binds 3000 inside; HOST_PORT is the host-side port.
       - "${HOST_PORT:-3100}:3000"
     environment:
-      # Auto-load on startup; unset = AI picks one via list_bundles/start_bundle.
-      - BUNDLE_PATH=${BUNDLE_PATH:-}
       - BUNDLES_DIR=${BUNDLES_DIR:-/bundles}
       # Internal proxy address troubleshoot-live + kubectl share inside the container.
       - PROXY_ADDRESS=${PROXY_ADDRESS:-localhost:8080}
+      # Stop a bundle load that exceeds this deadline instead of leaving it to exhaust the host.
+      - CLUSTER_READY_TIMEOUT_MS=${CLUSTER_READY_TIMEOUT_MS:-300000}
       # Override for the upload URL shown by prepare_upload; leave unset to auto-detect from each request's Host header.
       - PUBLIC_URL=${PUBLIC_URL:-}
       # Upload size cap + idle TTL. Defaults: 5 GB / 6 h. Wiped on restart, deleted on stop_bundle.

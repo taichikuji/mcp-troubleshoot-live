@@ -2,9 +2,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import {
+  abortTimedOutBundle,
   bundleLoadError,
+  bundleLoadStartedAt,
   bundleLoading,
   bundlePhase,
+  bundlePhaseStartedAt,
   bundleReady,
   currentBundlePath,
   isBundleProcessRunning,
@@ -42,6 +45,7 @@ const INSTRUCTIONS = [
   "- kubectl_run only: read-only verbs, no shell pipes — use --selector/--field-selector or the grep param.",
   "- Large responses (>200 KB) include a narrowing hint.",
   "- Do NOT run kubectl or troubleshoot-live directly on the user's machine.",
+  "- If loading times out, do not retry the same bundle automatically; report the failure.",
 ].join("\n");
 
 // Per-phase poll hint surfaced through cluster_status.
@@ -55,6 +59,9 @@ const PHASE_HINTS: Record<string, string> = {
   failed: "load failed. See bundleLoadError.",
   idle: "no bundle loaded.",
 };
+
+const elapsedSeconds = (since: number | null): number =>
+  since === null ? 0 : Math.max(0, Math.round((Date.now() - since) / 1000));
 
 // Cluster-ready guard + error boundary for tool handlers.
 async function readyTool(name: string, fn: () => Promise<ToolResult>): Promise<ToolResult> {
@@ -157,9 +164,10 @@ export function createServer(): McpServer {
       }
 
       markLoading();
+      let generation: number;
       try {
-        // Resolves after the 2s grace period; child keeps running in background.
-        await startBundle(resolved);
+        // Resolves once the child spawns; loading continues in the background.
+        generation = await startBundle(resolved);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         markFailed(msg);
@@ -171,7 +179,11 @@ export function createServer(): McpServer {
       void (async () => {
         log("[MCP] Waiting for Kubernetes API to become ready…");
         const ok = await waitForCluster();
-        markReady(ok, startedFor);
+        if (ok) {
+          markReady(startedFor, generation);
+        } else {
+          await abortTimedOutBundle(startedFor, generation);
+        }
       })();
 
       return textResult(
@@ -240,11 +252,16 @@ export function createServer(): McpServer {
       }
       if (bundleLoading) {
         return textResult(
-          `status=loading, phase=${bundlePhase}\nLoading bundle: ${currentBundlePath}\n${PHASE_HINTS[bundlePhase]}`,
+          `status=loading, phase=${bundlePhase}, elapsed=${elapsedSeconds(bundleLoadStartedAt)}s, ` +
+            `phaseElapsed=${elapsedSeconds(bundlePhaseStartedAt)}s\n` +
+            `Loading bundle: ${currentBundlePath}\n${PHASE_HINTS[bundlePhase]}`,
         );
       }
       if (bundleLoadError) {
-        return errorResult(`status=failed, phase=failed\nLast load error:\n${bundleLoadError}`);
+        return errorResult(
+          `status=failed, phase=failed\nLast load error:\n${bundleLoadError}\n` +
+            "Do not retry the same bundle automatically.",
+        );
       }
       return textResult(
         "status=idle, phase=idle\nNo bundle loaded. Use list_bundles to see available bundles, then start_bundle to load one.",
@@ -375,15 +392,6 @@ export function createServer(): McpServer {
       }
       return textResult(output);
     }),
-  );
-
-  server.registerTool(
-    "help",
-    {
-      description:
-        "Return the recommended workflow and usage notes for this MCP server. Call this if you are unsure which tool to use next or want to review the investigation workflow.",
-    },
-    async () => safeRun("help", async () => textResult(INSTRUCTIONS)),
   );
 
   return server;

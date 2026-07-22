@@ -19,13 +19,12 @@ An MCP server (TypeScript) wrapping [`troubleshoot-live`](https://github.com/mhr
 ```
 config.ts        env vars, no side effects
 log.ts           log() (stderr), ToolResult, safeRun, textResult, errorResult
-schemas.ts       shared Zod schemas
 cache.ts         kubectl response cache
-kubectl.ts       runKubectl, tokenize, withSizeHint, nsArgs, READ_ONLY_VERBS
+kubectl.ts       runKubectl, tokenize, withSizeHint, READ_ONLY_VERBS
 uploads.ts       upload sanitization, sweeper, listBundleFiles, PUT handler
 request-context.ts  AsyncLocalStorage for per-request base URL
 bundle.ts        troubleshoot-live child process lifecycle
-tools.ts         createServer, all 16 tool registrations
+tools.ts         createServer, all 7 tool registrations
 transport.ts     Express routes
 index.ts         startup, /health, signal handling
 ```
@@ -60,19 +59,8 @@ The dependency graph is acyclic. Keep it that way.
 
 ## Adding a tool
 
-Single kubectl call? Use `registerKubectlTool`:
-
-```typescript
-registerKubectlTool(server, "get_configmaps", {
-  description: "List configmaps, optionally filtered by namespace.",
-  inputSchema: {
-    namespace: namespaceSchema.optional().describe("Namespace. Omit for all namespaces."),
-  },
-  buildArgs: ({ namespace }) => ["get", "configmaps", ...nsArgs(namespace), "-o", "wide"],
-});
-```
-
-Custom logic? Use `server.registerTool(...)`, wrap in `readyTool` or `safeRun`, return `textResult`/`errorResult`.
+Use `server.registerTool(...)`, wrap the handler in `readyTool` or `safeRun`, and return
+`textResult`/`errorResult`.
 
 After adding a tool: update the **Tools** table in `README.md`, update the tool count, and update `INSTRUCTIONS` in `tools.ts` if it changes the recommended workflow.
 

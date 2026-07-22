@@ -71,6 +71,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -97,18 +98,12 @@ describe("state transitions", () => {
     expect(bundle.bundleLoadError).toBeNull();
     expect(bundle.bundlePhase).toBe("spawning");
 
-    bundle.markReady(true, path);
+    bundle.markReady(path, bundle.currentBundleGeneration);
     expect(bundle.bundleLoading).toBe(false);
     expect(bundle.bundleReady).toBe(true);
     expect(bundle.bundlePhase).toBe("ready");
 
     bundle.markLoading();
-    bundle.markReady(false, path);
-    expect(bundle.bundleLoading).toBe(false);
-    expect(bundle.bundleReady).toBe(false);
-    expect(bundle.bundlePhase).toBe("failed");
-    expect(bundle.bundleLoadError).toContain("did not become ready");
-
     bundle.markFailed("explicit failure");
     expect(bundle.bundleLoading).toBe(false);
     expect(bundle.bundlePhase).toBe("failed");
@@ -119,7 +114,7 @@ describe("state transitions", () => {
     await createStartedBundleProcess("/mock/bundles/current.tar.gz");
 
     bundle.markLoading();
-    bundle.markReady(true, "/mock/bundles/other.tar.gz");
+    bundle.markReady("/mock/bundles/other.tar.gz", bundle.currentBundleGeneration);
 
     expect(bundle.bundleLoading).toBe(true);
     expect(bundle.bundleReady).toBe(false);
@@ -142,11 +137,11 @@ describe("requireReady", () => {
     expect(loading?.content[0]?.text).toContain("still loading bundle");
     expect(loading?.content[0]?.text).toContain("phase=spawning");
 
-    bundle.markReady(true, path);
+    bundle.markReady(path, bundle.currentBundleGeneration);
     expect(bundle.requireReady()).toBeNull();
 
     bundle.markLoading();
-    bundle.markReady(false, path);
+    bundle.markFailed("explicit failure");
     const failed = bundle.requireReady();
     expect(failed?.isError).toBe(true);
     expect(failed?.content[0]?.text).toContain("Last bundle load failed");
@@ -169,7 +164,7 @@ describe("startBundle + waitForCluster", () => {
         "--proxy-address",
         "127.0.0.1:8443",
       ],
-      { stdio: ["ignore", "pipe", "pipe"] },
+      { stdio: ["ignore", "pipe", "pipe"], detached: true },
     );
   });
 
@@ -191,5 +186,48 @@ describe("startBundle + waitForCluster", () => {
   it("returns false when waitForCluster times out without ready signal", async () => {
     await createStartedBundleProcess("/mock/bundles/timeout.tar.gz");
     await expect(bundle.waitForCluster(5)).resolves.toBe(false);
+  });
+
+  it("stops a timed-out process and preserves the failure", async () => {
+    const path = "/mock/uploads/timeout-abort.tar.gz";
+    const child = await createStartedBundleProcess(path);
+    bundle.markLoading();
+    child.stderr.emit("data", Buffer.from("Importing bundle resources\n"));
+
+    const aborted = bundle.abortTimedOutBundle(path, bundle.currentBundleGeneration);
+    expect(child.kill).toHaveBeenCalledWith("SIGINT");
+    child.emit("exit", null, "SIGINT");
+    await aborted;
+
+    expect(bundle.isBundleProcessRunning()).toBe(false);
+    expect(bundle.bundlePhase).toBe("failed");
+    expect(bundle.bundleLoadError).toContain("timed out");
+    expect(bundle.bundleLoadError).toContain("phase=importing");
+    expect(bundle.bundleLoadError).toContain("Do not retry");
+  });
+
+  it("does not stop a newer bundle generation", async () => {
+    const path = "/mock/bundles/generation.tar.gz";
+    const child = await createStartedBundleProcess(path);
+    const staleGeneration = bundle.currentBundleGeneration - 1;
+
+    await bundle.abortTimedOutBundle(path, staleGeneration);
+
+    expect(child.kill).not.toHaveBeenCalled();
+    expect(bundle.isBundleProcessRunning()).toBe(true);
+  });
+
+  it("escalates to SIGKILL when graceful stop hangs", async () => {
+    vi.useFakeTimers();
+    const child = await createStartedBundleProcess("/mock/bundles/hung.tar.gz");
+
+    const stopped = bundle.stopBundle(10_000);
+    expect(child.kill).toHaveBeenCalledWith("SIGINT");
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+
+    child.emit("exit", null, "SIGKILL");
+    await stopped;
   });
 });

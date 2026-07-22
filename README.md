@@ -16,7 +16,7 @@ It boots an envtest Kubernetes apiserver from a support bundle and gives your AI
 
 Digging through Kubernetes support bundles manually is tedious. I wanted to just *talk* to my bundle instead.
 
-With 8 focused tools, you can triage conversationally — even when the bundle only lives on your local machine.
+With 7 focused tools, you can triage conversationally — even when the bundle only lives on your local machine.
 
 ## How do I use it?
 
@@ -61,7 +61,7 @@ Two ways:
 
 ## What tools does it have?
 
-It comes packed with 8 focused tools to help you out!
+It comes packed with 7 focused tools to help you out!
 
 | Tool | Purpose |
 | --- | --- |
@@ -72,16 +72,21 @@ It comes packed with 8 focused tools to help you out!
 | `cluster_status` | Reports if the cluster is `idle`, `loading`, `ready`, or `failed`. |
 | `cluster_overview` | **Batched triage tool!** Gets nodes, namespaces, not-ready pods, and warnings in one go. |
 | `kubectl_run` | Read-only kubectl for all queries — supports `grep` filter param. |
-| `help` | Print the recommended investigation workflow and usage notes. |
 
 ## Configuration
 
 Everything is configured via environment variables. See [`.env.example`](./.env.example) for the full list.
 
 **Performance:**
-* **Response cache** — `kubectl` results are cached for 5 minutes (`KUBECTL_CACHE_TTL_MS`). Bundles are immutable, so identical queries are free.
+* **Response cache** — up to 256 `kubectl` results are cached and cleared on bundle switch. Bundles are immutable, so identical queries are free.
 * **Batched triage** — `cluster_overview` runs 4 kubectls in parallel and returns them as one blob.
 * **Soft size limit** — responses over 200 KB get a narrowing hint appended. Nothing is silently truncated.
+
+**Bundle loading:**
+* Allocate at least **4 GB RAM** to the MCP host; **8 GB** is recommended for large NKP bundles. `kube-apiserver` and `etcd` can exhaust a 2 GB host before import completes.
+* The image temporarily pins troubleshoot-live **v0.2.0**. Version v0.2.1 hard-codes eight import workers and can cause swap thrashing on small hosts; neither release exposes a worker-count setting.
+* A load exceeding `CLUSTER_READY_TIMEOUT_MS` is terminated and reported as failed. Clients should not retry the same bundle automatically.
+* Upgrade beyond v0.2.0 when upstream exposes configurable import concurrency and skips pod log files before resource parsing. See the [upstream issue proposal](./TROUBLESHOOT_LIVE_UPSTREAM_ISSUE.md).
 
 ## Security
 

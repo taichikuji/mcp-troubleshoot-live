@@ -79,11 +79,6 @@ export function withSizeHint(text: string): string {
   );
 }
 
-export function nsArgs(namespace: string | undefined, allNamespacesFallback = true): string[] {
-  if (namespace) return ["-n", namespace];
-  return allNamespacesFallback ? ["-A"] : [];
-}
-
 export async function runKubectl(args: string[]): Promise<string> {
   if (!existsSync(KUBECONFIG_PATH)) {
     return "No kubeconfig found. Start a bundle first with the start_bundle tool.";

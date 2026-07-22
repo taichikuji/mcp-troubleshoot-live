@@ -35,7 +35,6 @@ vi.mock("../src/config.js", () => ({
 type KubectlModule = typeof import("../src/kubectl.js");
 
 let tokenize: KubectlModule["tokenize"];
-let nsArgs: KubectlModule["nsArgs"];
 let runKubectl: KubectlModule["runKubectl"];
 
 beforeEach(async () => {
@@ -47,7 +46,7 @@ beforeEach(async () => {
   mocks.promisify.mockReturnValue(mocks.execFileAsync);
   mocks.execFileAsync.mockResolvedValue({ stdout: "ok", stderr: "" });
 
-  ({ tokenize, nsArgs, runKubectl } = await import("../src/kubectl.js"));
+  ({ tokenize, runKubectl } = await import("../src/kubectl.js"));
 });
 
 describe("tokenize", () => {
@@ -73,17 +72,6 @@ describe("tokenize", () => {
       "app name",
       `has "quotes"`,
     ]);
-  });
-});
-
-describe("nsArgs", () => {
-  it("returns namespace args when namespace is provided", () => {
-    expect(nsArgs("kube-system")).toEqual(["-n", "kube-system"]);
-  });
-
-  it("falls back to all namespaces when namespace is omitted", () => {
-    expect(nsArgs(undefined)).toEqual(["-A"]);
-    expect(nsArgs(undefined, false)).toEqual([]);
   });
 });
 

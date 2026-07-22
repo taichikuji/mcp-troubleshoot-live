@@ -8,21 +8,30 @@ const mocks = vi.hoisted(() => ({
 
 const bundleState = vi.hoisted(() => ({
   bundleLoadError: null as string | null,
+  bundleLoadStartedAt: null as number | null,
   bundleLoading: false,
   bundlePhase: "idle",
+  bundlePhaseStartedAt: null as number | null,
   bundleReady: false,
   currentBundlePath: null as string | null,
 }));
 
 vi.mock("../src/bundle.js", () => ({
+  abortTimedOutBundle: vi.fn(),
   get bundleLoadError() {
     return bundleState.bundleLoadError;
+  },
+  get bundleLoadStartedAt() {
+    return bundleState.bundleLoadStartedAt;
   },
   get bundleLoading() {
     return bundleState.bundleLoading;
   },
   get bundlePhase() {
     return bundleState.bundlePhase;
+  },
+  get bundlePhaseStartedAt() {
+    return bundleState.bundlePhaseStartedAt;
   },
   get bundleReady() {
     return bundleState.bundleReady;
@@ -94,8 +103,10 @@ beforeEach(async () => {
   vi.clearAllMocks();
 
   bundleState.bundleLoadError = null;
+  bundleState.bundleLoadStartedAt = null;
   bundleState.bundleLoading = false;
   bundleState.bundlePhase = "ready";
+  bundleState.bundlePhaseStartedAt = null;
   bundleState.bundleReady = true;
   bundleState.currentBundlePath = "/mock/bundles/a.tar.gz";
 
@@ -188,5 +199,40 @@ describe("prepare_upload tool output contract", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0]?.text).toContain("Cannot derive a safe filename");
+  });
+});
+
+describe("cluster_status lifecycle guidance", () => {
+  it("reports total and phase elapsed time while loading", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(100_000);
+    bundleState.bundleReady = false;
+    bundleState.bundleLoading = true;
+    bundleState.bundlePhase = "importing";
+    bundleState.bundleLoadStartedAt = 88_000;
+    bundleState.bundlePhaseStartedAt = 95_000;
+
+    const result = (await invokeTool(getRegisteredTool("cluster_status"), {})) as {
+      content: { text: string }[];
+    };
+
+    expect(result.content[0]?.text).toContain(
+      "status=loading, phase=importing, elapsed=12s, phaseElapsed=5s",
+    );
+    now.mockRestore();
+  });
+
+  it("tells clients not to retry a failed bundle automatically", async () => {
+    bundleState.bundleReady = false;
+    bundleState.bundleLoading = false;
+    bundleState.bundlePhase = "failed";
+    bundleState.bundleLoadError = "import timed out";
+
+    const result = (await invokeTool(getRegisteredTool("cluster_status"), {})) as {
+      content: { text: string }[];
+      isError?: boolean;
+    };
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain("Do not retry the same bundle automatically");
   });
 });
