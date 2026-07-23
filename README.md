@@ -54,15 +54,20 @@ The server exposes 10 tools:
 | `cluster_status` | Report `idle`, `extracting`, `indexing`, `ready`, or `failed`. |
 | `cluster_overview` | Return nodes, namespaces, not-ready pods, Warning events, and parse diagnostics. |
 | `resource_catalog` | Discover collected kinds, API versions, and accepted aliases. |
-| `resource_query` | Query and paginate resources by kind, namespace, labels, and dot-path fields. |
-| `pod_logs` | Read/search current or previous logs by exact pod or pod labels across containers. |
+| `resource_query` | Query and paginate resources with Kubernetes label operators and dot-path fields. |
+| `pod_logs` | Discover, read, search, and paginate current or previous logs across containers. |
 | `bundle_files` | List, read, or literal-search bounded raw diagnostic files. |
 
 Use `resource_catalog` before guessing version-specific CR names. `resource_query` returns compact
 summaries by default and a `nextOffset` when more results exist. Set `full=true` only when the
 complete collected object is needed. The reader supports JSON and YAML resources, missing-GVK
-inference for standard Troubleshoot paths, configmaps/secrets, nested List resources, and both
-pod-log layouts used by Troubleshoot.
+inference for standard Troubleshoot paths, configmaps/secrets, nested List resources, and aliases
+from Kubernetes discovery data (including short and group-qualified names).
+
+`pod_logs` indexes canonical Troubleshoot log files independently of Pod objects, searches the
+complete collected file, and returns `nextOffset`/`nextLineOffset` for bounded continuation.
+Official collector symlinks are intentionally not materialized because their canonical log files
+are already present.
 
 Tool responses above 200 KB are rejected with a narrowing hint instead of flooding client context.
 

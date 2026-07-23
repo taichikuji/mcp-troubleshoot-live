@@ -40,8 +40,8 @@ const INSTRUCTIONS = [
   "1. Call list_bundles. If the requested bundle is absent, use prepare_upload and run its returned command.",
   "2. Call start_bundle. If it reports loading, poll cluster_status until ready.",
   "3. Use cluster_overview first for general triage.",
-  "4. Use resource_catalog when the requested resource name is unknown or version-specific.",
-  "5. Use resource_query for Kubernetes objects and pod_logs for label-based multi-container logs/search.",
+  "4. Use resource_catalog for collected kinds and Kubernetes aliases.",
+  "5. Use resource_query for structured Kubernetes selectors and pod_logs for pageable multi-container logs/search.",
   "6. Use bundle_files only for diagnostics not represented as Kubernetes resources or pod logs.",
   "7. Use full=true only when needed; narrow queries and follow nextOffset for more results.",
   "8. Call stop_bundle when done.",
@@ -59,6 +59,14 @@ const boundedResult = (text: string): ToolResult => {
     `Response is ${Math.ceil(bytes / 1024)} KB, above the ` +
     `${Math.ceil(RESPONSE_SOFT_LIMIT_BYTES / 1024)} KB safety limit. Narrow the query.`,
   );
+};
+
+const labelSelectorSchema = {
+  labels: z.record(z.string()).optional().describe("Exact metadata label matches."),
+  label_in: z.record(z.array(z.string()).min(1)).optional(),
+  label_not_in: z.record(z.array(z.string()).min(1)).optional(),
+  label_exists: z.array(z.string().min(1)).optional(),
+  label_not_exists: z.array(z.string().min(1)).optional(),
 };
 
 async function readyTool(name: string, fn: () => Promise<ToolResult>): Promise<ToolResult> {
@@ -236,9 +244,12 @@ export function createServer(): McpServer {
         api_version: z.string().optional(),
         namespace: z.string().optional(),
         name: z.string().optional(),
-        labels: z.record(z.string()).optional().describe("Exact metadata label matches."),
+        ...labelSelectorSchema,
         fields: z.record(z.string()).optional().describe(
           "Exact dot-path matches, including array indexes such as spec.rules[0].matches[0].",
+        ),
+        field_not_equals: z.record(z.string()).optional().describe(
+          "Dot-path values that must not equal the supplied value.",
         ),
         field_contains: z.record(z.string()).optional().describe(
           "Substring matches on dot-path values.",
@@ -260,7 +271,12 @@ export function createServer(): McpServer {
       namespace,
       name,
       labels,
+      label_in,
+      label_not_in,
+      label_exists,
+      label_not_exists,
       fields,
+      field_not_equals,
       field_contains,
       owner,
       sort_by,
@@ -277,7 +293,12 @@ export function createServer(): McpServer {
             namespace,
             name,
             labels,
+            labelIn: label_in,
+            labelNotIn: label_not_in,
+            labelExists: label_exists,
+            labelNotExists: label_not_exists,
             fields,
+            fieldNotEquals: field_not_equals,
             fieldContains: field_contains,
             owner,
             sortBy: sort_by,
@@ -297,24 +318,56 @@ export function createServer(): McpServer {
     "pod_logs",
     {
       description:
-        "Read or search collected logs. Select one pod/container exactly, or fan out by pod labels across all collected containers.",
+        "Read or search every collected current/previous pod log by namespace, pod, container, or pod labels. Supports file and line pagination.",
       inputSchema: {
         namespace: z.string().min(1).optional(),
         pod: z.string().min(1).optional(),
         container: z.string().min(1).optional(),
-        labels: z.record(z.string()).optional().describe("Exact pod label matches."),
+        ...labelSelectorSchema,
         search: z.string().min(1).optional().describe("Literal text to find in collected logs."),
         ignore_case: z.boolean().optional().describe("Case-insensitive search; default true."),
         previous: z.boolean().optional().describe("Read collected previous-container logs."),
         tail: z.number().int().positive().max(10_000).optional(),
+        offset: z.number().int().nonnegative().optional().describe(
+          "Log-file offset. Use nextOffset to continue.",
+        ),
         limit: z.number().int().positive().max(100).optional().describe("Maximum log files returned."),
+        line_offset: z.number().int().nonnegative().optional().describe(
+          "Forward line or matching-line offset; overrides tail.",
+        ),
+        line_limit: z.number().int().positive().max(10_000).optional(),
       },
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
-    async ({ namespace, pod, container, labels, search, ignore_case, previous, tail, limit }) =>
+    async ({
+      namespace,
+      pod,
+      container,
+      labels,
+      label_in,
+      label_not_in,
+      label_exists,
+      label_not_exists,
+      search,
+      ignore_case,
+      previous,
+      tail,
+      offset,
+      limit,
+      line_offset,
+      line_limit,
+    }) =>
       readyTool("pod_logs", async () => {
-        if (!pod && !labels) {
-          return errorResult("Provide pod or labels to bound the log query.");
+        if (
+          !namespace &&
+          !pod &&
+          !labels &&
+          !label_in &&
+          !label_not_in &&
+          !label_exists &&
+          !label_not_exists
+        ) {
+          return errorResult("Provide namespace, pod, or labels to bound the log query.");
         }
         try {
           return boundedResult(JSON.stringify(await queryPodLogs({
@@ -322,11 +375,18 @@ export function createServer(): McpServer {
             pod,
             container,
             labels,
+            labelIn: label_in,
+            labelNotIn: label_not_in,
+            labelExists: label_exists,
+            labelNotExists: label_not_exists,
             search,
             ignoreCase: ignore_case,
             previous,
             tail,
+            offset,
             limit,
+            lineOffset: line_offset,
+            lineLimit: line_limit,
           }), null, 2));
         } catch (err) {
           return errorResult(err instanceof Error ? err.message : String(err));

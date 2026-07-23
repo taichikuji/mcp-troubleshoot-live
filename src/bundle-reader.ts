@@ -25,13 +25,30 @@ type ResourceSource = {
   special?: "configmap" | "secret";
 };
 
-export type ResourceQuery = {
+type LabelQuery = {
+  labels?: Record<string, string>;
+  labelIn?: Record<string, string[]>;
+  labelNotIn?: Record<string, string[]>;
+  labelExists?: string[];
+  labelNotExists?: string[];
+};
+
+type LogSource = {
+  path: string;
+  relativePath: string;
+  namespace: string;
+  pod: string;
+  container: string;
+  previous: boolean;
+};
+
+export type ResourceQuery = LabelQuery & {
   kind: string;
   apiVersion?: string;
   namespace?: string;
   name?: string;
-  labels?: Record<string, string>;
   fields?: Record<string, string>;
+  fieldNotEquals?: Record<string, string>;
   fieldContains?: Record<string, string>;
   owner?: string;
   sortBy?: string;
@@ -51,16 +68,18 @@ export type ResourceQueryResult = {
   items: KubeObject[];
 };
 
-export type PodLogQuery = {
+export type PodLogQuery = LabelQuery & {
   namespace?: string;
   pod?: string;
   container?: string;
-  labels?: Record<string, string>;
   search?: string;
   ignoreCase?: boolean;
   previous?: boolean;
   tail?: number;
+  offset?: number;
   limit?: number;
+  lineOffset?: number;
+  lineLimit?: number;
 };
 
 const SKIP_RESOURCE_FILES = new Set([
@@ -115,6 +134,37 @@ const aliasesFor = (kind: string): string[] => {
   return [singular, plural];
 };
 
+const hasLabelQuery = (query: LabelQuery): boolean =>
+  Boolean(
+    query.labels ||
+    query.labelIn ||
+    query.labelNotIn ||
+    query.labelExists?.length ||
+    query.labelNotExists?.length,
+  );
+
+const matchesLabels = (labels: KubeObject, query: LabelQuery): boolean => {
+  if (
+    query.labels &&
+    Object.entries(query.labels).some(([key, value]) => labels[key] !== value)
+  ) return false;
+  if (
+    query.labelIn &&
+    Object.entries(query.labelIn).some(([key, values]) =>
+      typeof labels[key] !== "string" || !values.includes(labels[key] as string)
+    )
+  ) return false;
+  if (
+    query.labelNotIn &&
+    Object.entries(query.labelNotIn).some(([key, values]) =>
+      typeof labels[key] === "string" && values.includes(labels[key] as string)
+    )
+  ) return false;
+  if (query.labelExists?.some((key) => typeof labels[key] !== "string")) return false;
+  if (query.labelNotExists?.some((key) => typeof labels[key] === "string")) return false;
+  return true;
+};
+
 const parseObjectList = (value: unknown): KubeObject[] => {
   if (Array.isArray(value)) return value.flatMap(parseObjectList);
   const object = asObject(value);
@@ -166,6 +216,13 @@ export async function extractBundleArchive(
       const output = safeArchivePath(header.name, destination);
       if (header.type === "directory") {
         await mkdir(output, { recursive: true });
+        stream.once("end", next);
+        stream.resume();
+        return;
+      }
+      // Troubleshoot archives contain convenience links for named log collectors.
+      // Never materialize links; canonical log files are stored separately.
+      if (header.type === "symlink" || header.type === "link") {
         stream.once("end", next);
         stream.resume();
         return;
@@ -240,7 +297,9 @@ export class BundleReader {
   readonly diagnostics: string[] = [];
 
   private readonly sources = new Map<string, Set<ResourceSource>>();
+  private readonly sourceAliases = new Map<ResourceSource, Set<string>>();
   private readonly parsed = new Map<string, KubeObject[]>();
+  private readonly logSources: LogSource[] = [];
 
   private constructor(root: string, extractionDir: string) {
     this.root = root;
@@ -266,13 +325,20 @@ export class BundleReader {
     }
   }
 
+  private addAlias(source: ResourceSource, alias: string): void {
+    const normalized = normalizeKind(alias);
+    if (!normalized) return;
+    const entries = this.sources.get(normalized) ?? new Set<ResourceSource>();
+    entries.add(source);
+    this.sources.set(normalized, entries);
+    const aliases = this.sourceAliases.get(source) ?? new Set<string>();
+    aliases.add(alias.toLowerCase());
+    this.sourceAliases.set(source, aliases);
+  }
+
   private addSource(source: ResourceSource, extraAlias?: string): void {
-    const aliases = new Set([...aliasesFor(source.kind), normalizeKind(extraAlias ?? "")]);
-    for (const alias of aliases) {
-      if (!alias) continue;
-      const entries = this.sources.get(alias) ?? new Set<ResourceSource>();
-      entries.add(source);
-      this.sources.set(alias, entries);
+    for (const alias of [...aliasesFor(source.kind), extraAlias ?? ""]) {
+      this.addAlias(source, alias);
     }
   }
 
@@ -327,6 +393,8 @@ export class BundleReader {
       }
     }
     await this.addCrdAliases();
+    await this.addDiscoveryAliases(resourcesRoot);
+    await this.indexPodLogs(signal);
   }
 
   private async addCrdAliases(): Promise<void> {
@@ -348,12 +416,82 @@ export class BundleReader {
         if (group) {
           namesAndAliases.push(...namesAndAliases.slice(0, 2).map((name) => `${name}.${group}`));
         }
-        for (const alias of namesAndAliases.map(normalizeKind)) {
-          const entries = this.sources.get(alias) ?? new Set<ResourceSource>();
-          for (const target of targets) entries.add(target);
-          this.sources.set(alias, entries);
+        for (const alias of namesAndAliases) {
+          for (const target of targets) this.addAlias(target, alias);
         }
       }
+    }
+  }
+
+  private async addDiscoveryAliases(resourcesRoot: string): Promise<void> {
+    try {
+      const lists = JSON.parse(await readFile(join(resourcesRoot, "resources.json"), "utf8"));
+      if (!Array.isArray(lists)) return;
+      for (const value of lists) {
+        const list = asObject(value);
+        if (!list || typeof list.groupVersion !== "string" || !Array.isArray(list.resources)) {
+          continue;
+        }
+        const group = list.groupVersion.includes("/") ? list.groupVersion.split("/")[0]! : "";
+        for (const resourceValue of list.resources) {
+          const resource = asObject(resourceValue);
+          if (
+            !resource ||
+            typeof resource.kind !== "string" ||
+            typeof resource.name !== "string" ||
+            resource.name.includes("/")
+          ) continue;
+          const targets = this.sources.get(normalizeKind(resource.kind));
+          if (!targets) continue;
+          const aliases = [
+            resource.name,
+            resource.singularName,
+            ...(Array.isArray(resource.shortNames) ? resource.shortNames : []),
+          ].filter((alias): alias is string => typeof alias === "string" && alias.length > 0);
+          if (group) {
+            aliases.push(`${resource.name}.${group}`);
+            if (typeof resource.singularName === "string" && resource.singularName) {
+              aliases.push(`${resource.singularName}.${group}`);
+            }
+          }
+          for (const source of targets) {
+            if (source.apiVersion && source.apiVersion !== list.groupVersion) continue;
+            for (const alias of aliases) this.addAlias(source, alias);
+          }
+        }
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        this.diagnostics.push(
+          `cluster-resources/resources.json: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  }
+
+  private async indexPodLogs(signal?: AbortSignal): Promise<void> {
+    const logsRoot = join(this.root, "cluster-resources", "pods", "logs");
+    try {
+      for (const path of await walkFiles(logsRoot, signal)) {
+        const rel = relative(logsRoot, path).split(sep).join("/");
+        const parts = rel.split("/");
+        if (parts.length !== 3 || !parts[2]!.endsWith(".log")) continue;
+        const file = parts[2]!;
+        if (file.endsWith("-logs-errors.log")) continue;
+        const previous = file.endsWith("-previous.log");
+        const container = file.slice(0, previous ? -"-previous.log".length : -".log".length);
+        if (!container) continue;
+        this.logSources.push({
+          path,
+          relativePath: relative(this.root, path).split(sep).join("/"),
+          namespace: parts[0]!,
+          pod: parts[1]!,
+          container,
+          previous,
+        });
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
   }
 
@@ -405,20 +543,12 @@ export class BundleReader {
     apiVersion?: string;
     aliases: string[];
   }> {
-    const aliases = new Map<ResourceSource, Set<string>>();
-    for (const [alias, sources] of this.sources) {
-      for (const source of sources) {
-        const values = aliases.get(source) ?? new Set<string>();
-        values.add(alias);
-        aliases.set(source, values);
-      }
-    }
     const unique = new Map<string, {
       kind: string;
       apiVersion?: string;
       aliases: Set<string>;
     }>();
-    for (const [source, sourceAliases] of aliases) {
+    for (const [source, sourceAliases] of this.sourceAliases) {
       const key = `${source.kind}|${source.apiVersion ?? ""}`;
       const entry = unique.get(key) ?? {
         kind: source.kind,
@@ -434,7 +564,7 @@ export class BundleReader {
         !needle ||
         normalizeKind(entry.kind).includes(needle) ||
         normalizeKind(entry.apiVersion ?? "").includes(needle) ||
-        [...entry.aliases].some((alias) => alias.includes(needle))
+        [...entry.aliases].some((alias) => normalizeKind(alias).includes(needle))
       )
       .map((entry) => ({
         kind: entry.kind,
@@ -466,13 +596,16 @@ export class BundleReader {
         if (query.apiVersion && object.apiVersion !== query.apiVersion) continue;
         if (query.namespace && meta.namespace !== query.namespace) continue;
         if (query.name && meta.name !== query.name) continue;
-        if (
-          query.labels &&
-          Object.entries(query.labels).some(([key, value]) => asObject(meta.labels)?.[key] !== value)
-        ) continue;
+        if (!matchesLabels(asObject(meta.labels) ?? {}, query)) continue;
         if (
           query.fields &&
           Object.entries(query.fields).some(([key, value]) => String(nested(object, key)) !== value)
+        ) continue;
+        if (
+          query.fieldNotEquals &&
+          Object.entries(query.fieldNotEquals).some(([key, value]) =>
+            String(nested(object, key)) === value
+          )
         ) continue;
         if (
           query.fieldContains &&
@@ -562,27 +695,86 @@ export class BundleReader {
     return trailingNewline ? `${output}\n` : output;
   }
 
+  private async exactLogSource(
+    namespace: string,
+    pod: string,
+    container: string,
+    previous: boolean,
+  ): Promise<LogSource | null> {
+    const suffix = `${container}${previous ? "-previous" : ""}.log`;
+    const paths = [
+      join(this.root, "pod-logs", namespace, `${pod}-${suffix}`),
+      join(this.root, "cluster-resources", "pods", "logs", namespace, pod, suffix),
+    ];
+    for (const path of paths) {
+      try {
+        if (!(await stat(path)).isFile()) continue;
+        return {
+          path,
+          relativePath: relative(this.root, path).split(sep).join("/"),
+          namespace,
+          pod,
+          container,
+          previous,
+        };
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      }
+    }
+    return null;
+  }
+
   async queryPodLogs(query: PodLogQuery): Promise<{
     matchedPods: number;
+    total: number;
+    offset: number;
     returned: number;
     truncated: boolean;
-    logs: Array<{ namespace: string; pod: string; container: string; text: string }>;
+    nextOffset?: number;
+    logs: Array<{
+      namespace: string;
+      pod: string;
+      container: string;
+      previous: boolean;
+      path: string;
+      totalLines: number;
+      matchedLines?: number;
+      lineOffset: number;
+      returnedLines: number;
+      nextLineOffset?: number;
+      text: string;
+    }>;
   }> {
     const limit = Math.min(Math.max(query.limit ?? 20, 1), 100);
     const tail = Math.min(Math.max(query.tail ?? 200, 1), 10_000);
-    const pods = await this.query({
-      kind: "Pod",
-      namespace: query.namespace,
-      name: query.pod,
-      labels: query.labels,
-      limit: 50_000,
-      full: true,
-    });
-    const candidates: Array<{ namespace: string; pod: string; container: string }> = [];
-    for (const podObject of pods.items) {
+    const offset = Math.max(query.offset ?? 0, 0);
+    const lineLimit = Math.min(Math.max(query.lineLimit ?? 200, 1), 10_000);
+    const previous = query.previous ?? false;
+    const podItems = this.sources.has(normalizeKind("Pod"))
+      ? (await this.query({
+        kind: "Pod",
+        namespace: query.namespace,
+        name: query.pod,
+        labels: query.labels,
+        labelIn: query.labelIn,
+        labelNotIn: query.labelNotIn,
+        labelExists: query.labelExists,
+        labelNotExists: query.labelNotExists,
+        limit: 50_000,
+        full: true,
+      })).items
+      : [];
+    const selectedPods = new Set<string>();
+    const candidates = new Map<string, LogSource>();
+    const addCandidate = (source: LogSource): void => {
+      candidates.set(source.path, source);
+    };
+
+    for (const podObject of podItems) {
       const meta = metadata(podObject);
       const namespace = String(meta.namespace ?? "default");
       const pod = String(meta.name ?? "");
+      selectedPods.add(`${namespace}\0${pod}`);
       const spec = asObject(podObject.spec) ?? {};
       const containerNames = [
         ...(Array.isArray(spec.initContainers) ? spec.initContainers : []),
@@ -590,50 +782,81 @@ export class BundleReader {
         ...(Array.isArray(spec.ephemeralContainers) ? spec.ephemeralContainers : []),
       ].map((container) => String(asObject(container)?.name ?? "")).filter(Boolean);
       for (const container of query.container ? [query.container] : containerNames) {
-        candidates.push({ namespace, pod, container });
+        const source = await this.exactLogSource(namespace, pod, container, previous);
+        if (source) addCandidate(source);
       }
-    }
-    if (candidates.length === 0 && query.namespace && query.pod && query.container) {
-      candidates.push({
-        namespace: query.namespace,
-        pod: query.pod,
-        container: query.container,
-      });
     }
 
-    const logs: Array<{ namespace: string; pod: string; container: string; text: string }> = [];
-    let truncated = false;
-    for (const candidate of candidates) {
-      if (logs.length >= limit) {
-        truncated = true;
-        break;
-      }
-      try {
-        let text = await this.podLogs(
-          candidate.namespace,
-          candidate.pod,
-          candidate.container,
-          query.search ? 10_000 : tail,
-          query.previous,
-        );
-        if (query.search) {
-          const needle = query.ignoreCase === false ? query.search : query.search.toLowerCase();
-          const lines = text.replace(/\r?\n$/, "").split(/\r?\n/).filter((line) => {
-            const candidateLine = query.ignoreCase === false ? line : line.toLowerCase();
-            return candidateLine.includes(needle);
-          });
-          text = lines.slice(-tail).join("\n");
-          if (text) text += "\n";
-        }
-        if (!query.search || text) logs.push({ ...candidate, text });
-      } catch (err) {
-        if (!(err instanceof Error) || !err.message.startsWith("Logs not found")) throw err;
-      }
+    for (const source of this.logSources) {
+      if (source.previous !== previous) continue;
+      if (query.namespace && source.namespace !== query.namespace) continue;
+      if (query.pod && source.pod !== query.pod) continue;
+      if (query.container && source.container !== query.container) continue;
+      if (hasLabelQuery(query) && !selectedPods.has(`${source.namespace}\0${source.pod}`)) continue;
+      addCandidate(source);
     }
+    if (query.namespace && query.pod && query.container) {
+      const source = await this.exactLogSource(
+        query.namespace,
+        query.pod,
+        query.container,
+        previous,
+      );
+      if (source) addCandidate(source);
+    }
+
+    const ordered = [...candidates.values()].sort((a, b) =>
+      `${a.namespace}/${a.pod}/${a.container}/${a.relativePath}`.localeCompare(
+        `${b.namespace}/${b.pod}/${b.container}/${b.relativePath}`,
+      )
+    );
+    const page = ordered.slice(offset, offset + limit);
+    const logs = [];
+    for (const source of page) {
+      const data = await readFile(source.path, "utf8");
+      const trailingNewline = /\r?\n$/.test(data);
+      const body = data.replace(/\r?\n$/, "");
+      const allLines = body ? body.split(/\r?\n/) : [];
+      const needle = query.search &&
+        (query.ignoreCase === false ? query.search : query.search.toLowerCase());
+      const filtered = needle
+        ? allLines.filter((line) =>
+          (query.ignoreCase === false ? line : line.toLowerCase()).includes(needle)
+        )
+        : allLines;
+      if (query.search && filtered.length === 0) continue;
+      const lineOffset = query.lineOffset === undefined
+        ? Math.max(filtered.length - tail, 0)
+        : Math.max(query.lineOffset, 0);
+      const lines = filtered.slice(
+        lineOffset,
+        lineOffset + (query.lineOffset === undefined ? tail : lineLimit),
+      );
+      const nextLineOffset = lineOffset + lines.length;
+      let text = lines.join("\n");
+      if (text && (trailingNewline || query.search)) text += "\n";
+      logs.push({
+        namespace: source.namespace,
+        pod: source.pod,
+        container: source.container,
+        previous: source.previous,
+        path: source.relativePath,
+        totalLines: allLines.length,
+        ...(query.search ? { matchedLines: filtered.length } : {}),
+        lineOffset,
+        returnedLines: lines.length,
+        ...(nextLineOffset < filtered.length ? { nextLineOffset } : {}),
+        text,
+      });
+    }
+    const nextOffset = offset + page.length;
     return {
-      matchedPods: pods.total,
+      matchedPods: new Set(ordered.map((source) => `${source.namespace}\0${source.pod}`)).size,
+      total: ordered.length,
+      offset,
       returned: logs.length,
-      truncated,
+      truncated: nextOffset < ordered.length,
+      ...(nextOffset < ordered.length ? { nextOffset } : {}),
       logs,
     };
   }

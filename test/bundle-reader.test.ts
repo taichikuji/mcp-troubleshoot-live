@@ -12,13 +12,19 @@ import { BundleReader, extractBundleArchive } from "../src/bundle-reader.js";
 
 const temporary: string[] = [];
 
-async function archive(entries: Record<string, string>): Promise<{ dir: string; path: string }> {
+async function archive(
+  entries: Record<string, string>,
+  links: Record<string, string> = {},
+): Promise<{ dir: string; path: string }> {
   const dir = await mkdtemp(join(tmpdir(), "bundle-reader-test-"));
   temporary.push(dir);
   const path = join(dir, "fixture.tar.gz");
   const pack = tar.pack();
   const writing = pipeline(pack, createGzip(), createWriteStream(path));
   for (const [name, body] of Object.entries(entries)) pack.entry({ name }, body);
+  for (const [name, linkname] of Object.entries(links)) {
+    pack.entry({ name, linkname, type: "symlink" });
+  }
   pack.finalize();
   await writing;
   return { dir, path };
@@ -58,6 +64,31 @@ async function fixture(): Promise<{ reader: BundleReader; dir: string }> {
       reason: "FailedScheduling",
       lastTimestamp: "2026-07-23T10:00:00Z",
     }]),
+    "fixture/cluster-resources/daemonsets/default.json": list([{
+      apiVersion: "apps/v1",
+      kind: "DaemonSet",
+      metadata: { name: "agent", namespace: "default", labels: { tier: "system" } },
+      status: { numberReady: 1 },
+    }]),
+    "fixture/cluster-resources/resources.json": JSON.stringify([{
+      groupVersion: "v1",
+      resources: [{
+        name: "pods",
+        singularName: "pod",
+        namespaced: true,
+        kind: "Pod",
+        shortNames: ["po"],
+      }],
+    }, {
+      groupVersion: "apps/v1",
+      resources: [{
+        name: "daemonsets",
+        singularName: "daemonset",
+        namespaced: true,
+        kind: "DaemonSet",
+        shortNames: ["ds"],
+      }],
+    }]),
     "fixture/cluster-resources/custom-resource-definitions.json": list([{
       apiVersion: "apiextensions.k8s.io/v1",
       kind: "CustomResourceDefinition",
@@ -96,6 +127,11 @@ async function fixture(): Promise<{ reader: BundleReader; dir: string }> {
     "fixture/pod-logs/default/web-0-app.log": "one\ntwo\nthree\n",
     "fixture/cluster-resources/pods/logs/default/worker-0/worker.log": "alpha\nbeta\n",
     "fixture/cluster-resources/pods/logs/default/worker-0/worker-previous.log": "old failure\n",
+    "fixture/cluster-resources/pods/logs/default/orphan/app.log": "first\nsecond\nthird\n",
+    "fixture/cluster-resources/pods/logs/default/orphan/sidecar.log": "sidecar\n",
+    "fixture/cluster-resources/pods/logs/default/orphan/app-previous.log": "orphan old\n",
+    "fixture/cluster-resources/pods/logs/default/deep/app.log":
+      `early match\n${Array.from({ length: 10_001 }, (_, index) => `line ${index}`).join("\n")}\n`,
     "fixture/host-collectors/system/node-1/cpu.txt": "CPU healthy\nrequest failed with 404\n",
   });
   const extraction = join(dir, "extracted");
@@ -125,6 +161,21 @@ describe("BundleReader", () => {
     expect(firstPage).toMatchObject({ total: 2, offset: 0, truncated: true, nextOffset: 1 });
     await expect(reader.query({ kind: "Pod", limit: 1, offset: firstPage.nextOffset }))
       .resolves.toMatchObject({ total: 2, offset: 1, truncated: false });
+    await expect(reader.query({
+      kind: "po",
+      labelIn: { app: ["web", "worker"] },
+      labelNotIn: { app: ["worker"] },
+      labelExists: ["app"],
+      labelNotExists: ["missing"],
+      fieldNotEquals: { "status.phase": "Pending" },
+    })).resolves.toMatchObject({ total: 1 });
+    await expect(reader.query({ kind: "ds", name: "agent" })).resolves.toMatchObject({
+      total: 1,
+      items: [expect.objectContaining({ kind: "DaemonSet" })],
+    });
+    expect(reader.resourceCatalog("daemonsets.apps")[0]?.aliases).toEqual(
+      expect.arrayContaining(["daemonsets", "daemonsets.apps", "ds"]),
+    );
 
     const widgets = await reader.query({ kind: "Widget", name: "sample", full: true });
     expect(widgets.total).toBe(1);
@@ -176,6 +227,47 @@ describe("BundleReader", () => {
     })).resolves.toMatchObject({
       logs: [{ pod: "worker-0", container: "worker", text: "old failure\n" }],
     });
+
+    const orphan = await reader.queryPodLogs({
+      namespace: "default",
+      pod: "orphan",
+      limit: 1,
+      lineOffset: 0,
+      lineLimit: 2,
+    });
+    expect(orphan).toMatchObject({
+      matchedPods: 1,
+      total: 2,
+      offset: 0,
+      returned: 1,
+      truncated: true,
+      nextOffset: 1,
+      logs: [{
+        pod: "orphan",
+        container: "app",
+        path: "cluster-resources/pods/logs/default/orphan/app.log",
+        totalLines: 3,
+        lineOffset: 0,
+        returnedLines: 2,
+        nextLineOffset: 2,
+        text: "first\nsecond\n",
+      }],
+    });
+    await expect(reader.queryPodLogs({
+      namespace: "default",
+      pod: "deep",
+      search: "early match",
+    })).resolves.toMatchObject({
+      logs: [{ matchedLines: 1, text: "early match\n" }],
+    });
+    await expect(reader.queryPodLogs({
+      namespace: "default",
+      pod: "orphan",
+      container: "app",
+      previous: true,
+    })).resolves.toMatchObject({
+      logs: [{ previous: true, text: "orphan old\n" }],
+    });
   });
 
   it("lists, reads, and searches bounded raw bundle files", async () => {
@@ -202,5 +294,25 @@ describe("BundleReader", () => {
 
     await expect(extractBundleArchive(path, extraction)).rejects.toThrow("Unsafe archive path");
     await expect(readFile(join(dir, "escape.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("ignores official log symlinks without materializing them", async () => {
+    const { dir, path } = await archive({
+      "fixture/cluster-resources/nodes.json": "[]",
+      "fixture/cluster-resources/pods/logs/default/web/app.log": "safe\n",
+    }, {
+      "fixture/all-logs/web/app.log":
+        "../../../cluster-resources/pods/logs/default/web/app.log",
+    });
+    const reader = await BundleReader.open(path, join(dir, "linked"), () => {});
+
+    await expect(reader.queryPodLogs({
+      namespace: "default",
+      pod: "web",
+      container: "app",
+    })).resolves.toMatchObject({ logs: [{ text: "safe\n" }] });
+    await expect(readFile(join(reader.root, "all-logs/web/app.log"), "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 });
