@@ -6,7 +6,7 @@ Notes for any AI agent working on this codebase.
 
 ## What this project is
 
-An MCP server (TypeScript) wrapping [`troubleshoot-live`](https://github.com/mhrabovcin/troubleshoot-live). It boots an envtest Kubernetes apiserver from a support bundle and exposes read-only `kubectl` tools over HTTP so an LLM can triage the bundle conversationally.
+An MCP server (TypeScript) that reads Troubleshoot Kubernetes support bundles directly. It extracts and catalogs immutable bundle files, then exposes structured resource and pod-log tools for LLM triage. There is no Kubernetes API server, `kubectl`, or `troubleshoot-live` runtime.
 
 - **Transport**: HTTP — Streamable HTTP at `POST /mcp`, legacy SSE at `GET /sse` + `POST /messages`.
 - **Runtime**: Node 22, ES modules, TypeScript strict.
@@ -19,12 +19,11 @@ An MCP server (TypeScript) wrapping [`troubleshoot-live`](https://github.com/mhr
 ```
 config.ts        env vars, no side effects
 log.ts           log() (stderr), ToolResult, safeRun, textResult, errorResult
-cache.ts         kubectl response cache
-kubectl.ts       runKubectl, tokenize, withSizeHint, READ_ONLY_VERBS
+bundle-reader.ts secure extraction, resource catalog/query, logs
 uploads.ts       upload sanitization, sweeper, listBundleFiles, PUT handler
 request-context.ts  AsyncLocalStorage for per-request base URL
-bundle.ts        troubleshoot-live child process lifecycle
-tools.ts         createServer, all 7 tool registrations
+bundle.ts        active reader lifecycle and bundle state
+tools.ts         createServer, all 8 tool registrations
 transport.ts     Express routes
 index.ts         startup, /health, signal handling
 ```
@@ -39,21 +38,21 @@ The dependency graph is acyclic. Keep it that way.
 
 2. **Every tool handler must be wrapped** in `safeRun` or `readyTool`. Never raw.
 
-3. **Every kubectl-backed tool must check `requireReady()` first.** `readyTool` does this.
+3. **Every bundle-backed tool must check `requireReady()` first.** `readyTool` does this.
 
 4. **Long-running operations must return immediately.** `start_bundle` returns `status=loading`; the model polls `cluster_status`. Don't block handlers on multi-minute work.
 
-5. **Cache is safe because bundles are immutable.** Never cache kubectl errors.
+5. **Cache is safe because bundles are immutable.** Shared-bundle reuse is keyed by path, size, and mtime.
 
-6. **`kubectl_run` is read-only.** `READ_ONLY_VERBS` in `kubectl.ts` is the security boundary. Don't add mutating verbs.
+6. **Archive extraction is a trust boundary.** Reject traversal, links, unsupported entry types, excessive expanded bytes, and excessive file counts.
 
-7. **`tokenize()` is load-bearing.** It's the only thing protecting `kubectl_run` from shell metacharacters. Don't replace it with `args.split(/\s+/)`.
+7. **Keep queries structured.** Do not add shell commands or emulate free-form kubectl syntax.
 
 8. **Upload filenames are restricted.** `sanitizeFilename` enforces `[A-Za-z0-9._-]+\.(tar\.gz|tgz|tar)`. Don't loosen it.
 
 9. **Both transports stay.** `/mcp` and `/sse` + `/messages`. Removing SSE breaks older client configs.
 
-10. **Bundle state lives in `bundle.ts` only.** The `let` exports are read-only on the importer side. Mutation goes through `markLoading` / `markReady` / `markFailed`.
+10. **Bundle state lives in `bundle.ts` only.** The `let` exports are read-only on the importer side.
 
 ---
 

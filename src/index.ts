@@ -1,5 +1,3 @@
-import { rmSync } from "fs";
-
 import express, { type Request, type Response } from "express";
 
 import {
@@ -7,17 +5,17 @@ import {
   bundleLoading,
   bundleReady,
   currentBundlePath,
+  initBundleCache,
   stopBundle,
 } from "./bundle.js";
 import {
+  BUNDLE_CACHE_DIR,
   BUNDLES_DIR,
-  CLUSTER_READY_TIMEOUT_MS,
-  KUBECONFIG_PATH,
-  KUBECTL_CACHE_MAX_ENTRIES,
+  MAX_ARCHIVE_FILES,
+  MAX_EXTRACTED_BYTES,
   MAX_UPLOAD_BYTES,
   PORT,
   PUBLIC_URL_OVERRIDE,
-  TROUBLESHOOT_LIVE_WORKDIR,
   UPLOAD_DIR,
   UPLOAD_SWEEP_INTERVAL_MS,
   UPLOAD_TTL_MS,
@@ -42,13 +40,13 @@ app.get("/health", (_req: Request, res: Response) => {
     currentBundle: currentBundlePath,
     bundlesDir: BUNDLES_DIR,
     uploadDir: UPLOAD_DIR,
-    kubeconfig: KUBECONFIG_PATH,
+    cacheDir: BUNDLE_CACHE_DIR,
   });
 });
 
 async function main(): Promise<void> {
   initUploadDir();
-  rmSync(TROUBLESHOOT_LIVE_WORKDIR, { recursive: true, force: true });
+  initBundleCache();
 
   log(
     `[MCP] Upload dir: ${UPLOAD_DIR} (max ${(MAX_UPLOAD_BYTES / 1024 / 1024 / 1024).toFixed(1)} GB, TTL ${Math.round(UPLOAD_TTL_MS / 3_600_000)}h)`,
@@ -58,10 +56,9 @@ async function main(): Promise<void> {
       ? `[MCP] Upload base URL pinned via PUBLIC_URL=${PUBLIC_URL_OVERRIDE}`
       : `[MCP] Upload base URL: auto-detected from each MCP request's Host header (set PUBLIC_URL to override)`,
   );
-  log(`[MCP] kubectl cache: max ${KUBECTL_CACHE_MAX_ENTRIES} entries (cleared on bundle switch)`);
   log(
-    `[MCP] Bundle load timeout: ${Math.round(CLUSTER_READY_TIMEOUT_MS / 1000)}s ` +
-      "(timed-out child processes are stopped)",
+    `[MCP] Bundle extraction: max ${(MAX_EXTRACTED_BYTES / 1024 / 1024 / 1024).toFixed(1)} GB / ` +
+      `${MAX_ARCHIVE_FILES} files; cache ${BUNDLE_CACHE_DIR}`,
   );
 
   const sweepTimer = setInterval(() => sweepUploads(currentBundlePath), UPLOAD_SWEEP_INTERVAL_MS);

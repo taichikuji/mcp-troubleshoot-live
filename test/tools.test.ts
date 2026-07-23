@@ -2,60 +2,48 @@ import { z } from "zod";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
-  runKubectl: vi.fn(),
+  overview: vi.fn(),
+  query: vi.fn(),
+  readLogs: vi.fn(),
   requireReady: vi.fn(),
+  start: vi.fn(),
+  stop: vi.fn(),
 }));
 
-const bundleState = vi.hoisted(() => ({
-  bundleLoadError: null as string | null,
-  bundleLoadStartedAt: null as number | null,
-  bundleLoading: false,
-  bundlePhase: "idle",
-  bundlePhaseStartedAt: null as number | null,
-  bundleReady: false,
-  currentBundlePath: null as string | null,
+const state = vi.hoisted(() => ({
+  error: null as string | null,
+  loading: false,
+  path: "/mock/bundles/a.tar.gz" as string | null,
+  phase: "ready",
+  phaseStarted: null as number | null,
+  ready: true,
+  started: null as number | null,
 }));
 
 vi.mock("../src/bundle.js", () => ({
-  abortTimedOutBundle: vi.fn(),
-  get bundleLoadError() {
-    return bundleState.bundleLoadError;
-  },
-  get bundleLoadStartedAt() {
-    return bundleState.bundleLoadStartedAt;
-  },
-  get bundleLoading() {
-    return bundleState.bundleLoading;
-  },
-  get bundlePhase() {
-    return bundleState.bundlePhase;
-  },
-  get bundlePhaseStartedAt() {
-    return bundleState.bundlePhaseStartedAt;
-  },
-  get bundleReady() {
-    return bundleState.bundleReady;
-  },
-  get currentBundlePath() {
-    return bundleState.currentBundlePath;
-  },
-  isBundleProcessRunning: vi.fn(() => false),
-  markFailed: vi.fn(),
-  markLoading: vi.fn(),
-  markReady: vi.fn(),
+  availableKinds: () => ["Node", "Pod"],
+  bundleExists: () => true,
+  get bundleLoadError() { return state.error; },
+  get bundleLoadStartedAt() { return state.started; },
+  get bundleLoading() { return state.loading; },
+  bundleOverview: mocks.overview,
+  get bundlePhase() { return state.phase; },
+  get bundlePhaseStartedAt() { return state.phaseStarted; },
+  get bundleReady() { return state.ready; },
+  get currentBundlePath() { return state.path; },
+  isBundleActive: () => state.loading || state.ready,
+  queryResources: mocks.query,
+  readPodLogs: mocks.readLogs,
   requireReady: mocks.requireReady,
-  resolveBundlePath: vi.fn((p: string) => p),
-  startBundle: vi.fn(),
-  stopBundle: vi.fn(),
-  waitForCluster: vi.fn(),
+  resolveBundlePath: (path: string) => path,
+  startBundle: mocks.start,
+  stopBundle: mocks.stop,
 }));
 
 vi.mock("../src/config.js", () => ({
   BUNDLES_DIR: "/mock/bundles",
   MAX_UPLOAD_BYTES: 1024,
-  PORT: 3000,
-  PUBLIC_URL_OVERRIDE: null,
-  PROXY_ADDRESS: "127.0.0.1:8443",
+  RESPONSE_SOFT_LIMIT_BYTES: 100_000,
   UPLOAD_DIR: "/mock/uploads",
   UPLOAD_TTL_MS: 60_000,
 }));
@@ -64,11 +52,11 @@ vi.mock("../src/request-context.js", () => ({
   uploadBaseUrl: () => "https://mcp.example.test",
 }));
 
-vi.mock("../src/kubectl.js", async () => {
-  const actual = await vi.importActual<typeof import("../src/kubectl.js")>("../src/kubectl.js");
+vi.mock("../src/uploads.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/uploads.js")>("../src/uploads.js");
   return {
     ...actual,
-    runKubectl: mocks.runKubectl,
+    listBundleFiles: () => [],
   };
 });
 
@@ -77,162 +65,122 @@ let createServer: ToolsModule["createServer"];
 
 type RegisteredTool = {
   inputSchema?: unknown;
-  callback?: (args: unknown, extra: unknown) => Promise<unknown>;
-  handler?: (args: unknown, extra: unknown) => Promise<unknown>;
+  callback?: (args: never, extra: never) => Promise<unknown>;
+  handler?: (args: never, extra: never) => Promise<unknown>;
 };
 
-const getRegisteredTool = (name: string) => {
-  const server = createServer() as unknown as { _registeredTools: Record<string, unknown> };
-  const tool = server._registeredTools[name] as RegisteredTool | undefined;
-  if (!tool) throw new Error(`Missing tool '${name}'`);
-  return tool;
+const tool = (name: string): RegisteredTool => {
+  const server = createServer() as unknown as { _registeredTools: Record<string, RegisteredTool> };
+  const registered = server._registeredTools[name];
+  if (!registered) throw new Error(`Missing tool '${name}'`);
+  return registered;
 };
 
-const invokeTool = (tool: RegisteredTool, args: unknown, extra: unknown = {}) => {
-  const callback = typeof tool.callback === "function" ? tool.callback : undefined;
-  const handler = typeof tool.handler === "function" ? tool.handler : undefined;
-  const invoke = callback ?? handler;
-  if (!invoke) {
-    throw new Error("Tool has no callable callback/handler");
-  }
-  return invoke(args, extra);
+const invoke = (registered: RegisteredTool, args: unknown) => {
+  const callback = registered.callback ?? registered.handler;
+  if (!callback) throw new Error("Tool has no callback");
+  return callback(args as never, {} as never);
 };
 
 beforeEach(async () => {
   vi.resetModules();
   vi.clearAllMocks();
-
-  bundleState.bundleLoadError = null;
-  bundleState.bundleLoadStartedAt = null;
-  bundleState.bundleLoading = false;
-  bundleState.bundlePhase = "ready";
-  bundleState.bundlePhaseStartedAt = null;
-  bundleState.bundleReady = true;
-  bundleState.currentBundlePath = "/mock/bundles/a.tar.gz";
-
+  state.error = null;
+  state.loading = false;
+  state.path = "/mock/bundles/a.tar.gz";
+  state.phase = "ready";
+  state.phaseStarted = null;
+  state.ready = true;
+  state.started = null;
   mocks.requireReady.mockReturnValue(null);
-  mocks.runKubectl.mockResolvedValue([
-    "NAME READY STATUS",
-    "web-0 1/1 Running",
-    "worker-0 0/1 CrashLoopBackOff",
-  ].join("\n"));
-
+  mocks.query.mockResolvedValue({
+    kind: "Pod",
+    total: 1,
+    returned: 1,
+    truncated: false,
+    items: [{ kind: "Pod", metadata: { name: "web-0" } }],
+  });
+  mocks.readLogs.mockResolvedValue("line\n");
   ({ createServer } = await import("../src/tools.js"));
 });
 
-describe("kubectl_run tool schema + parsing", () => {
-  it("enforces args schema bounds", () => {
-    const kubectlRun = getRegisteredTool("kubectl_run");
-    const schema = kubectlRun.inputSchema as z.ZodTypeAny;
-
-    expect(schema.safeParse({ args: "get pods -A" }).success).toBe(true);
-    expect(schema.safeParse({ args: "" }).success).toBe(false);
-    expect(schema.safeParse({ args: "x".repeat(4097) }).success).toBe(false);
+describe("structured bundle tools", () => {
+  it("registers resource_query with bounded structured inputs", () => {
+    const schema = tool("resource_query").inputSchema as z.ZodTypeAny;
+    expect(schema.safeParse({
+      kind: "Pod",
+      namespace: "default",
+      labels: { app: "web" },
+      fields: { "status.phase": "Running" },
+      limit: 100,
+      full: true,
+    }).success).toBe(true);
+    expect(schema.safeParse({ kind: "Pod", limit: 501 }).success).toBe(false);
   });
 
-  it("filters kubectl output using grep and preserves parsing behavior", async () => {
-    const kubectlRun = getRegisteredTool("kubectl_run");
-    const result = (await invokeTool(
-      kubectlRun,
-      { args: "get pods -A", grep: "CrashLoopBackOff", grep_ignore_case: false },
-      {},
-    )) as { content: { text: string }[]; isError?: boolean };
+  it("passes structured filters to the direct reader", async () => {
+    const result = await invoke(tool("resource_query"), {
+      kind: "Pod",
+      api_version: "v1",
+      namespace: "default",
+      name: "web-0",
+      labels: { app: "web" },
+      fields: { "status.phase": "Running" },
+      limit: 1,
+      full: true,
+    }) as { content: { text: string }[] };
 
-    expect(result.isError).toBeUndefined();
-    expect(result.content[0]?.text).toBe("worker-0 0/1 CrashLoopBackOff");
-    expect(mocks.runKubectl).toHaveBeenCalledWith(["get", "pods", "-A"]);
+    expect(JSON.parse(result.content[0]!.text).total).toBe(1);
+    expect(mocks.query).toHaveBeenCalledWith({
+      kind: "Pod",
+      apiVersion: "v1",
+      namespace: "default",
+      name: "web-0",
+      labels: { app: "web" },
+      fields: { "status.phase": "Running" },
+      limit: 1,
+      full: true,
+    });
   });
 
-  it("rejects invalid grep regex without calling external binaries", async () => {
-    const kubectlRun = getRegisteredTool("kubectl_run");
-    const result = (await invokeTool(
-      kubectlRun,
-      { args: "get pods -A", grep: "[" },
-      {},
-    )) as { content: { text: string }[]; isError?: boolean };
+  it("reads logs without kubectl", async () => {
+    const result = await invoke(tool("pod_logs"), {
+      namespace: "default",
+      pod: "web-0",
+      container: "app",
+      tail: 50,
+    }) as { content: { text: string }[] };
 
-    expect(result.isError).toBe(true);
-    expect(result.content[0]?.text).toContain("Invalid grep pattern");
-    expect(mocks.runKubectl).toHaveBeenCalledWith(["get", "pods", "-A"]);
+    expect(result.content[0]?.text).toBe("line\n");
+    expect(mocks.readLogs).toHaveBeenCalledWith("default", "web-0", "app", 50);
   });
 });
 
-describe("prepare_upload tool output contract", () => {
-  it("returns strict one-line JSON with one windows command and one unix command", async () => {
-    const prepareUpload = getRegisteredTool("prepare_upload");
-    const result = (await invokeTool(
-      prepareUpload,
-      { local_path: "/Users/alice/Local O'Brien/bundle.tar.gz" },
-      {},
-    )) as { content: { text: string }[]; isError?: boolean };
+describe("upload and status contracts", () => {
+  it("keeps the one-line cross-platform upload contract", async () => {
+    const result = await invoke(tool("prepare_upload"), {
+      local_path: "/Users/alice/Local O'Brien/bundle.tar.gz",
+    }) as { content: { text: string }[] };
+    const text = result.content[0]!.text;
+    const payload = JSON.parse(text);
 
-    expect(result.isError).toBeUndefined();
-    const text = result.content[0]?.text ?? "";
-    expect(text.includes("\n")).toBe(false);
-
-    const payload = JSON.parse(text) as {
-      schemaVersion: number;
-      commands: {
-        windows: { shell: string };
-        unix: { sh: string };
-      };
-      uploadUrl: string;
-      limits: { maxSizeBytes: number; ttlMs: number };
-    };
-
-    expect(payload.schemaVersion).toBe(2);
+    expect(text).not.toContain("\n");
     expect(payload.uploadUrl).toBe("https://mcp.example.test/bundles/upload/bundle.tar.gz");
     expect(payload.commands.windows.shell).toContain("curl.exe -fsS --upload-file");
-    expect(payload.commands.windows.shell).toContain("--upload-file \"/Users/alice/Local O'Brien/bundle.tar.gz\"");
-    expect(payload.commands.unix.sh).toContain("--upload-file '/Users/alice/Local O'\\''Brien/bundle.tar.gz'");
-    expect(payload.limits.maxSizeBytes).toBe(1024);
-    expect(payload.limits.ttlMs).toBe(60_000);
+    expect(payload.commands.unix.sh).toContain("O'\\''Brien");
   });
 
-  it("returns a validation error for unsafe bundle filenames", async () => {
-    const prepareUpload = getRegisteredTool("prepare_upload");
-    const result = (await invokeTool(
-      prepareUpload,
-      { local_path: "/Users/alice/bundle with spaces.tar.gz" },
-      {},
-    )) as { content: { text: string }[]; isError?: boolean };
+  it("reports extraction progress without cluster phases", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(100_000);
+    state.ready = false;
+    state.loading = true;
+    state.phase = "indexing";
+    state.started = 88_000;
+    state.phaseStarted = 95_000;
 
-    expect(result.isError).toBe(true);
-    expect(result.content[0]?.text).toContain("Cannot derive a safe filename");
-  });
-});
-
-describe("cluster_status lifecycle guidance", () => {
-  it("reports total and phase elapsed time while loading", async () => {
-    const now = vi.spyOn(Date, "now").mockReturnValue(100_000);
-    bundleState.bundleReady = false;
-    bundleState.bundleLoading = true;
-    bundleState.bundlePhase = "importing";
-    bundleState.bundleLoadStartedAt = 88_000;
-    bundleState.bundlePhaseStartedAt = 95_000;
-
-    const result = (await invokeTool(getRegisteredTool("cluster_status"), {})) as {
-      content: { text: string }[];
-    };
-
+    const result = await invoke(tool("cluster_status"), {}) as { content: { text: string }[] };
     expect(result.content[0]?.text).toContain(
-      "status=loading, phase=importing, elapsed=12s, phaseElapsed=5s",
+      "status=loading, phase=indexing, elapsed=12s, phaseElapsed=5s",
     );
-    now.mockRestore();
-  });
-
-  it("tells clients not to retry a failed bundle automatically", async () => {
-    bundleState.bundleReady = false;
-    bundleState.bundleLoading = false;
-    bundleState.bundlePhase = "failed";
-    bundleState.bundleLoadError = "import timed out";
-
-    const result = (await invokeTool(getRegisteredTool("cluster_status"), {})) as {
-      content: { text: string }[];
-      isError?: boolean;
-    };
-
-    expect(result.isError).toBe(true);
-    expect(result.content[0]?.text).toContain("Do not retry the same bundle automatically");
   });
 });

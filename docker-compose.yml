@@ -1,7 +1,7 @@
 services:
   troubleshoot-mcp:
     build: ./
-    # image: ghcr.io/your-org/troubleshoot-live-mcp
+    # image: ghcr.io/your-org/support-bundle-mcp
     restart: unless-stopped
     container_name: troubleshoot-mcp
     ports:
@@ -9,20 +9,14 @@ services:
       - "${HOST_PORT:-3100}:3000"
     environment:
       - BUNDLES_DIR=${BUNDLES_DIR:-/bundles}
-      # Internal proxy address troubleshoot-live + kubectl share inside the container.
-      - PROXY_ADDRESS=${PROXY_ADDRESS:-localhost:8080}
-      # Stop a bundle load that exceeds this deadline instead of leaving it to exhaust the host.
-      - CLUSTER_READY_TIMEOUT_MS=${CLUSTER_READY_TIMEOUT_MS:-300000}
       # Override for the upload URL shown by prepare_upload; leave unset to auto-detect from each request's Host header.
       - PUBLIC_URL=${PUBLIC_URL:-}
       # Upload size cap + idle TTL. Defaults: 5 GB / 6 h. Wiped on restart, deleted on stop_bundle.
       - MAX_UPLOAD_BYTES=${MAX_UPLOAD_BYTES:-5368709120}
       - UPLOAD_TTL_MS=${UPLOAD_TTL_MS:-21600000}
+      # Archive bomb limits: 20 GB expanded data and 500k files by default.
+      - MAX_EXTRACTED_BYTES=${MAX_EXTRACTED_BYTES:-21474836480}
+      - MAX_ARCHIVE_FILES=${MAX_ARCHIVE_FILES:-500000}
     volumes:
       # Optional: drop .tar.gz bundles here for direct loading without upload.
       - ./bundles:/bundles
-      # Cache envtest binaries (kube-apiserver + etcd) at the default setup-envtest path.
-      - envtest-cache:/home/node/.local/share/kubebuilder-envtest
-
-volumes:
-  envtest-cache:

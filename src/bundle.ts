@@ -1,20 +1,14 @@
-import { spawn, type ChildProcess } from "child_process";
-import { rmSync } from "fs";
-import { isAbsolute, join, resolve as resolvePath } from "path";
+import { existsSync, mkdirSync, rmSync } from "fs";
+import { stat } from "fs/promises";
+import { isAbsolute, join, resolve as resolvePath, sep } from "path";
 
-import { cacheClear } from "./cache.js";
-import {
-  BUNDLES_DIR,
-  CLUSTER_READY_TIMEOUT_MS,
-  KUBECONFIG_PATH,
-  PROXY_ADDRESS,
-  TROUBLESHOOT_LIVE_WORKDIR,
-  UPLOAD_DIR,
-} from "./config.js";
+import { BundleReader, type ResourceQuery, type ResourceQueryResult } from "./bundle-reader.js";
+import { BUNDLE_CACHE_DIR, BUNDLES_DIR, UPLOAD_DIR } from "./config.js";
 import { errorResult, log, type ToolResult } from "./log.js";
 import { maybeDeleteUpload } from "./uploads.js";
 
-// Bundle state. Only mutated here.
+export type BundlePhase = "idle" | "extracting" | "indexing" | "ready" | "failed";
+
 export let bundleReady = false;
 export let bundleLoading = false;
 export let bundleLoadError: string | null = null;
@@ -22,256 +16,176 @@ export let currentBundlePath: string | null = null;
 export let currentBundleGeneration = 0;
 export let bundleLoadStartedAt: number | null = null;
 export let bundlePhaseStartedAt: number | null = null;
-export type BundlePhase =
-  | "idle"
-  | "spawning"
-  | "starting_apiserver"
-  | "importing"
-  | "ready"
-  | "failed";
 export let bundlePhase: BundlePhase = "idle";
 
-let bundleProcess: ChildProcess | null = null;
-let recentProcessOutput: string[] = [];
-const MAX_OUTPUT_LINES = 100;
+let activeReader: BundleReader | null = null;
+let activeFingerprint: string | null = null;
+let loadAbort: AbortController | null = null;
+let cachedShared: {
+  path: string;
+  fingerprint: string;
+  reader: BundleReader;
+} | null = null;
 
-// Ready signal driven off troubleshoot-live's stderr. Reset per start.
-type Deferred<T> = { promise: Promise<T>; resolve: (value: T) => void };
-const deferred = <T>(): Deferred<T> => {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((r) => { resolve = r; });
-  return { promise, resolve };
+const isUpload = (path: string): boolean =>
+  resolvePath(path).startsWith(`${resolvePath(UPLOAD_DIR)}${sep}`);
+
+const setPhase = (phase: BundlePhase): void => {
+  bundlePhase = phase;
+  bundlePhaseStartedAt = Date.now();
 };
-let readySignal = deferred<boolean>();
 
-export const isBundleProcessRunning = (): boolean => bundleProcess !== null;
+const fingerprint = async (path: string): Promise<string> => {
+  const info = await stat(path);
+  return `${resolvePath(path)}:${info.size}:${info.mtimeMs}`;
+};
 
-// Resolve to an absolute path under BUNDLES_DIR or UPLOAD_DIR. Rejects traversal.
+export function initBundleCache(): void {
+  rmSync(BUNDLE_CACHE_DIR, { recursive: true, force: true });
+  mkdirSync(BUNDLE_CACHE_DIR, { recursive: true });
+}
+
 export function resolveBundlePath(input: string): string {
   const candidate = isAbsolute(input) ? input : join(BUNDLES_DIR, input);
-  const abs = resolvePath(candidate);
+  const absolute = resolvePath(candidate);
   const roots = [resolvePath(BUNDLES_DIR), resolvePath(UPLOAD_DIR)];
-  const ok = roots.some((r) => abs === r || abs.startsWith(r + "/"));
-  if (!ok) {
+  if (!roots.some((root) => absolute === root || absolute.startsWith(`${root}${sep}`))) {
     throw new Error(
       `Bundle path '${input}' is outside the allowed roots (${BUNDLES_DIR}, ${UPLOAD_DIR}).`,
     );
   }
-  return abs;
+  return absolute;
 }
 
-// Wait for the proxy-up stderr line, or give up at the deadline.
-export async function waitForCluster(maxWaitMs = CLUSTER_READY_TIMEOUT_MS): Promise<boolean> {
-  const timeout = new Promise<boolean>((resolve) => {
-    const t = setTimeout(() => resolve(false), maxWaitMs);
-    t.unref();
-  });
-  return Promise.race([readySignal.promise, timeout]);
-}
+export const isBundleActive = (): boolean =>
+  bundleLoading || bundleReady || currentBundlePath !== null;
 
-// Move the phase forward off upstream stderr markers.
-function observePhase(line: string): void {
-  if (bundlePhase === "ready" || bundlePhase === "failed") return;
-  if (line.includes("Running HTTPs proxy service on")) {
-    readySignal.resolve(true);
-    return;
+export async function startBundle(path: string): Promise<"ready" | "loading"> {
+  const expectedFingerprint = await fingerprint(path);
+  const generation = ++currentBundleGeneration;
+  bundleLoadStartedAt = Date.now();
+  bundleLoadError = null;
+  currentBundlePath = path;
+
+  if (
+    cachedShared &&
+    cachedShared.path === path &&
+    cachedShared.fingerprint === expectedFingerprint
+  ) {
+    activeReader = cachedShared.reader;
+    activeFingerprint = cachedShared.fingerprint;
+    cachedShared = null;
+    bundleReady = true;
+    bundleLoading = false;
+    setPhase("ready");
+    return "ready";
   }
-  if (line.includes("Importing bundle resources")) {
-    setPhase("importing");
-  } else if (line.includes("Starting k8s server")) {
-    setPhase("starting_apiserver");
+
+  if (cachedShared) {
+    void cachedShared.reader.destroy().catch((err: unknown) => {
+      log("[MCP] Failed to remove old bundle cache:", err);
+    });
+    cachedShared = null;
   }
-}
 
-function setPhase(phase: BundlePhase): void {
-  if (bundlePhase === phase) return;
-  bundlePhase = phase;
-  bundlePhaseStartedAt = Date.now();
-}
-
-export async function startBundle(bundlePath: string): Promise<number> {
-  return new Promise((resolve, reject) => {
-    log(`[MCP] Starting troubleshoot-live with bundle: ${bundlePath}`);
-    cacheClear();
-    readySignal = deferred<boolean>();
-    recentProcessOutput = [];
-    const generation = ++currentBundleGeneration;
-    bundleLoadStartedAt = Date.now();
-    bundlePhaseStartedAt = bundleLoadStartedAt;
-
-    const child = spawn(
-      "troubleshoot-live",
-      ["serve", bundlePath, "--output-kubeconfig", KUBECONFIG_PATH, "--proxy-address", PROXY_ADDRESS],
-      { stdio: ["ignore", "pipe", "pipe"], detached: true },
-    );
-    bundleProcess = child;
-    currentBundlePath = bundlePath;
-
-    let settled = false;
-    const settle = (fn: () => void) => {
-      if (settled) return;
-      settled = true;
-      fn();
-    };
-
-    // Keep recent stderr/stdout so an early-exit error message is useful.
-    const captureLine = (prefix: string, d: Buffer) => {
-      process.stderr.write(`[troubleshoot-live] ${d}`);
-      for (const line of d.toString().split("\n")) {
-        const content = line.trimEnd();
-        if (content.length === 0) continue;
-        recentProcessOutput.push(`${prefix}: ${content}`);
-        if (recentProcessOutput.length > MAX_OUTPUT_LINES) recentProcessOutput.shift();
-        if (prefix === "stderr") observePhase(content);
-      }
-    };
-
-    child.stdout?.on("data", (d: Buffer) => captureLine("stdout", d));
-    child.stderr?.on("data", (d: Buffer) => captureLine("stderr", d));
-
-    // 'spawn' fires only on successful exec; 'error' fires on missing binary.
-    child.once("spawn", () => settle(() => resolve(generation)));
-    child.on("error", (err) => {
-      bundleLoading = false;
-      bundleLoadError = err.message;
-      setPhase("failed");
-      readySignal.resolve(false);
-      settle(() => reject(err));
-    });
-    child.on("exit", (code, signal) => {
-      bundleReady = false;
-      bundleProcess = null;
-      currentBundlePath = null;
-      try { rmSync(TROUBLESHOOT_LIVE_WORKDIR, { recursive: true, force: true }); } catch {}
-      const reason = signal ? `signal ${signal}` : `code ${code}`;
-      log(`[MCP] troubleshoot-live exited with ${reason}`);
-      const output = recentProcessOutput.join("\n").trim();
-      const detail = output ? `\n\nProcess output:\n${output}` : "";
-      const msg = `troubleshoot-live exited before becoming ready (${reason})${detail}`;
-      if (bundleLoading) {
-        bundleLoading = false;
-        bundleLoadError = msg;
-      }
-      setPhase("failed");
-      readySignal.resolve(false);
-      settle(() => reject(new Error(msg)));
-    });
-  });
-}
-
-export async function stopBundle(timeoutMs = 10_000): Promise<void> {
-  const child = bundleProcess;
-  if (!child) return;
-  // Grab this before exit fires — the exit handler nulls it.
-  const wasPath = currentBundlePath;
-  log("[MCP] Stopping troubleshoot-live…");
-
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      bundleReady = false;
-      bundleLoading = false;
-      bundleLoadError = null;
-      bundleProcess = null;
-      currentBundlePath = null;
-      bundlePhase = "idle";
-      bundleLoadStartedAt = null;
-      bundlePhaseStartedAt = null;
-      cacheClear();
-      try { rmSync(KUBECONFIG_PATH, { force: true }); } catch {}
-      try { rmSync(TROUBLESHOOT_LIVE_WORKDIR, { recursive: true, force: true }); } catch {}
-      maybeDeleteUpload(wasPath);
-      resolve();
-    };
-
-    const signalProcessGroup = (signal: NodeJS.Signals) => {
-      try {
-        if (child.pid !== undefined) {
-          process.kill(-child.pid, signal);
-          return;
-        }
-      } catch {}
-      child.kill(signal);
-    };
-
-    child.once("exit", finish);
-    // troubleshoot-live handles SIGINT and then stops kube-apiserver + etcd.
-    signalProcessGroup("SIGINT");
-    const killTimer = setTimeout(() => {
-      if (!done) signalProcessGroup("SIGKILL");
-    }, 5_000);
-    killTimer.unref();
-    const giveUp = setTimeout(finish, timeoutMs);
-    giveUp.unref();
-  });
-}
-
-export function markLoading(): void {
   bundleReady = false;
   bundleLoading = true;
+  setPhase("extracting");
+  loadAbort = new AbortController();
+  const extractionDir = join(BUNDLE_CACHE_DIR, `bundle-${generation}`);
+  const signal = loadAbort.signal;
+
+  void BundleReader.open(
+    path,
+    extractionDir,
+    () => {
+      if (currentBundleGeneration === generation) setPhase("indexing");
+    },
+    signal,
+  ).then((reader) => {
+    if (currentBundleGeneration !== generation || currentBundlePath !== path) {
+      void reader.destroy();
+      return;
+    }
+    activeReader = reader;
+    activeFingerprint = expectedFingerprint;
+    loadAbort = null;
+    bundleReady = true;
+    bundleLoading = false;
+    setPhase("ready");
+    log(`[MCP] Bundle ready: ${path}`);
+  }).catch((err: unknown) => {
+    if (currentBundleGeneration !== generation || signal.aborted) return;
+    bundleReady = false;
+    bundleLoading = false;
+    loadAbort = null;
+    bundleLoadError = err instanceof Error ? err.message : String(err);
+    setPhase("failed");
+    log(`[MCP] Bundle load failed:`, err);
+  });
+
+  return "loading";
+}
+
+export async function stopBundle(): Promise<void> {
+  const path = currentBundlePath;
+  const reader = activeReader;
+  const readerFingerprint = activeFingerprint;
+  ++currentBundleGeneration;
+  loadAbort?.abort();
+  loadAbort = null;
+  activeReader = null;
+  activeFingerprint = null;
+  bundleReady = false;
+  bundleLoading = false;
   bundleLoadError = null;
-  setPhase("spawning");
-}
+  currentBundlePath = null;
+  bundleLoadStartedAt = null;
+  bundlePhaseStartedAt = null;
+  bundlePhase = "idle";
 
-export function markReady(expectedPath: string, expectedGeneration: number): void {
-  // A newer start_bundle/stop_bundle may have superseded this one.
-  if (currentBundlePath !== expectedPath || currentBundleGeneration !== expectedGeneration) return;
-  bundleReady = true;
-  bundleLoading = false;
-  setPhase("ready");
-}
-
-export function markFailed(msg: string): void {
-  bundleLoading = false;
-  bundleLoadError = msg;
-  setPhase("failed");
-}
-
-export async function abortTimedOutBundle(
-  expectedPath: string,
-  expectedGeneration: number,
-): Promise<void> {
-  if (
-    currentBundlePath !== expectedPath ||
-    currentBundleGeneration !== expectedGeneration
-  ) return;
-
-  const elapsedSeconds = bundleLoadStartedAt === null
-    ? Math.round(CLUSTER_READY_TIMEOUT_MS / 1000)
-    : Math.round((Date.now() - bundleLoadStartedAt) / 1000);
-  const output = recentProcessOutput.join("\n").trim();
-  const detail = output ? `\n\nRecent process output:\n${output}` : "";
-  const msg =
-    `Bundle import timed out after ${elapsedSeconds}s in phase=${bundlePhase}. ` +
-    `The troubleshoot-live process was stopped to protect the host. Do not retry the same ` +
-    `bundle automatically.${detail}`;
-
-  await stopBundle();
-  if (
-    bundleProcess === null &&
-    currentBundlePath === null &&
-    currentBundleGeneration === expectedGeneration
-  ) {
-    markFailed(msg);
+  if (!path) return;
+  if (reader && !isUpload(path)) {
+    cachedShared = { path, fingerprint: readerFingerprint ?? "", reader };
+  } else {
+    void reader?.destroy().catch((err: unknown) => {
+      log("[MCP] Failed to remove uploaded bundle cache:", err);
+    });
   }
+  if (isUpload(path)) maybeDeleteUpload(path);
 }
 
-// Null when ready; otherwise a tool result describing why it isn't.
 export function requireReady(): ToolResult | null {
-  if (bundleReady) return null;
+  if (bundleReady && activeReader) return null;
   if (bundleLoading) {
     return errorResult(
-      `Cluster is still loading bundle '${currentBundlePath}' (phase=${bundlePhase}). Poll cluster_status every few seconds until it reports ready, then retry this tool.`,
+      `Bundle '${currentBundlePath}' is still loading (phase=${bundlePhase}). Poll cluster_status until it reports ready.`,
     );
   }
   if (bundleLoadError) {
-    return errorResult(
-      `Last bundle load failed:\n${bundleLoadError}\nDo not retry the same bundle automatically.`,
-    );
+    return errorResult(`Last bundle load failed:\n${bundleLoadError}`);
   }
-  return errorResult(
-    "Cluster is not ready. Use start_bundle to load a support bundle, or check container logs.",
-  );
+  return errorResult("No bundle is ready. Use list_bundles, then start_bundle.");
 }
+
+const reader = (): BundleReader => {
+  if (!activeReader || !bundleReady) throw new Error("No bundle is ready");
+  return activeReader;
+};
+
+export const queryResources = (query: ResourceQuery): Promise<ResourceQueryResult> =>
+  reader().query(query);
+
+export const readPodLogs = (
+  namespace: string,
+  pod: string,
+  container: string,
+  tail: number,
+): Promise<string> => reader().podLogs(namespace, pod, container, tail);
+
+export const bundleOverview = (warningLimit: number): Promise<Record<string, unknown>> =>
+  reader().overview(warningLimit);
+
+export const availableKinds = (): string[] => reader().availableKinds();
+
+export const bundleExists = (path: string): boolean => existsSync(path);

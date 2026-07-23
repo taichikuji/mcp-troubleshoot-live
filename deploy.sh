@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# This script automates the process of cleaning up Docker containers, pulling the latest code from the default branch of a Git repository, and rebuilding and restarting the troubleshoot-live MCP server.
+# This script cleans up Docker containers, updates the repository, and rebuilds the support-bundle MCP server.
 # It includes the following features:
 # - Performs cleanup of Docker resources, gc stuff.
 # - You can run "--prune" in case you want a full teardown before redeploying.

@@ -1,95 +1,73 @@
-import { existsSync } from "fs";
-
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import {
-  abortTimedOutBundle,
+  availableKinds,
+  bundleExists,
   bundleLoadError,
   bundleLoadStartedAt,
   bundleLoading,
+  bundleOverview,
   bundlePhase,
   bundlePhaseStartedAt,
   bundleReady,
   currentBundlePath,
-  isBundleProcessRunning,
-  markFailed,
-  markLoading,
-  markReady,
+  isBundleActive,
+  queryResources,
+  readPodLogs,
   requireReady,
   resolveBundlePath,
   startBundle,
   stopBundle,
-  waitForCluster,
 } from "./bundle.js";
 import {
   BUNDLES_DIR,
   MAX_UPLOAD_BYTES,
-  PROXY_ADDRESS,
+  RESPONSE_SOFT_LIMIT_BYTES,
   UPLOAD_DIR,
   UPLOAD_TTL_MS,
 } from "./config.js";
-import { READ_ONLY_VERBS, runKubectl, tokenize } from "./kubectl.js";
 import { errorResult, log, safeRun, textResult, type ToolResult } from "./log.js";
 import { uploadBaseUrl } from "./request-context.js";
 import { cmdQuote, listBundleFiles, posixShellQuote, sanitizeFilename } from "./uploads.js";
 
 const INSTRUCTIONS = [
   "WORKFLOW:",
-  "1. Always call list_bundles first. If the bundle is present, go to step 3.",
-  "2. Bundle on user machine: prepare_upload → parse returned JSON → run matching upload command (windows.shell/unix.sh) on user machine → pass returned path to start_bundle.",
-  "3. start_bundle returns immediately. Poll cluster_status until status=ready. Do NOT inspect before then.",
-  "4. First triage: cluster_overview (nodes, namespaces, not-ready pods, warnings — one call).",
-  "5. All further queries: kubectl_run. Always pass --tail=N when fetching logs.",
-  "6. When done: stop_bundle.",
+  "1. Call list_bundles. If the requested bundle is absent, use prepare_upload and run its returned command.",
+  "2. Call start_bundle. If it reports loading, poll cluster_status until ready.",
+  "3. Use cluster_overview first for general triage.",
+  "4. Use resource_query for Kubernetes objects and pod_logs for container logs.",
+  "5. Use full=true only when the complete object is needed; narrow by namespace/name/labels/fields.",
+  "6. Call stop_bundle when done.",
   "",
-  "RULES:",
-  "- kubectl_run only: read-only verbs, no shell pipes — use --selector/--field-selector or the grep param.",
-  "- Large responses (>200 KB) include a narrowing hint.",
-  "- Do NOT run kubectl or troubleshoot-live directly on the user's machine.",
-  "- If loading times out, do not retry the same bundle automatically; report the failure.",
+  "The tools read the immutable support bundle directly. There is no live cluster and no kubectl.",
 ].join("\n");
-
-// Per-phase poll hint surfaced through cluster_status.
-const PHASE_HINTS: Record<string, string> = {
-  spawning: "troubleshoot-live just started. Poll again in ~2s.",
-  starting_apiserver:
-    "envtest apiserver booting. ~5–15s warm; up to ~2min on first-ever run (one-off ~185 MB binary download). Poll every 5s.",
-  importing:
-    "apiserver up; importing bundle resources (CRDs, namespaces, pods, events). ~30s–2min for large bundles. Poll every 5–10s.",
-  ready: "ready.",
-  failed: "load failed. See bundleLoadError.",
-  idle: "no bundle loaded.",
-};
 
 const elapsedSeconds = (since: number | null): number =>
   since === null ? 0 : Math.max(0, Math.round((Date.now() - since) / 1000));
 
-// Cluster-ready guard + error boundary for tool handlers.
-async function readyTool(name: string, fn: () => Promise<ToolResult>): Promise<ToolResult> {
-  return safeRun(name, async () => requireReady() ?? (await fn()));
-}
+const withSizeHint = (text: string): string => {
+  if (Buffer.byteLength(text) <= RESPONSE_SOFT_LIMIT_BYTES) return text;
+  return `${text}\n\n[note: large response; narrow resource_query by namespace, name, labels, or fields.]`;
+};
 
+async function readyTool(name: string, fn: () => Promise<ToolResult>): Promise<ToolResult> {
+  return safeRun(name, async () => requireReady() ?? await fn());
+}
 
 export function createServer(): McpServer {
   const server = new McpServer(
-    { name: "troubleshoot-live-mcp", version: "1.0.0" },
+    { name: "support-bundle-mcp", version: "2.0.0" },
     { instructions: INSTRUCTIONS },
   );
-
-  // ── Lifecycle / discovery ──────────────────────────────────────────────
 
   server.registerTool(
     "prepare_upload",
     {
       description:
-        "Use this when the user wants to investigate a support bundle that lives on their local machine and is not yet on the MCP server. BEFORE calling this, always call `list_bundles` first — the bundle may already be present, saving upload time. Returns strict one-line JSON with one Windows shell command and one shared Unix shell command (Linux/macOS), plus URL and size/TTL limits. Parse the JSON, run the matching command via your shell tool, then pass the returned path/name to `start_bundle`.",
+        "Prepare an upload command for a support bundle on the user's machine. Call list_bundles first.",
       inputSchema: {
-        local_path: z
-          .string()
-          .describe(
-            "Absolute path to the support bundle on the user's local machine (e.g. /Users/alice/Downloads/foo.tar.gz).",
-          ),
+        local_path: z.string().describe("Absolute local path to a .tar.gz, .tgz, or .tar bundle."),
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     },
@@ -98,24 +76,42 @@ export function createServer(): McpServer {
       const safe = sanitizeFilename(base);
       if (!safe) {
         return errorResult(
-          `Cannot derive a safe filename from '${base}'. The bundle filename must end in .tar.gz, .tgz, or .tar and contain only letters, digits, '.', '-', '_'. Rename the file locally and retry.`,
+          `Cannot derive a safe filename from '${base}'. Rename it to use only letters, digits, '.', '-', or '_' and a .tar.gz, .tgz, or .tar suffix.`,
         );
       }
       const url = `${uploadBaseUrl().replace(/\/+$/, "")}/bundles/upload/${encodeURIComponent(safe)}`;
-      const payload = {
+      return textResult(JSON.stringify({
         schemaVersion: 2,
         commands: {
-          windows: {
-            shell: `curl.exe -fsS --upload-file ${cmdQuote(local_path)} ${cmdQuote(url)}`,
-          },
-          unix: {
-            sh: `curl -fsS --upload-file ${posixShellQuote(local_path)} ${posixShellQuote(url)}`,
-          },
+          windows: { shell: `curl.exe -fsS --upload-file ${cmdQuote(local_path)} ${cmdQuote(url)}` },
+          unix: { sh: `curl -fsS --upload-file ${posixShellQuote(local_path)} ${posixShellQuote(url)}` },
         },
         uploadUrl: url,
         limits: { maxSizeBytes: MAX_UPLOAD_BYTES, ttlMs: UPLOAD_TTL_MS },
-      };
-      return textResult(JSON.stringify(payload));
+      }));
+    }),
+  );
+
+  server.registerTool(
+    "list_bundles",
+    {
+      description: `List support bundles available under ${BUNDLES_DIR}.`,
+      annotations: { readOnlyHint: true, idempotentHint: true },
+    },
+    async () => safeRun("list_bundles", async () => {
+      const files = listBundleFiles();
+      if (files.length === 0) {
+        return textResult(
+          `No bundles found in ${BUNDLES_DIR}. Use prepare_upload for a bundle on the user's machine.`,
+        );
+      }
+      return textResult([
+        "PATH\tSIZE\tMODIFIED",
+        ...files.map((file) => {
+          const active = file.path === currentBundlePath ? "\tactive" : "";
+          return `${file.path}\t${(file.sizeBytes / 1024 / 1024).toFixed(1)} MB\t${file.modified}${active}`;
+        }),
+      ].join("\n"));
     }),
   );
 
@@ -123,13 +119,9 @@ export function createServer(): McpServer {
     "start_bundle",
     {
       description:
-        "Load a support bundle into the live cluster. Returns IMMEDIATELY with status='ready' (warm, already loaded) or status='loading' (apiserver not yet up). If status is 'loading', poll `cluster_status` every few seconds until it reports 'ready' before calling other inspection tools — `cluster_status` includes a `phase` field that tells you which stage is in flight. Pass: (a) a bare filename in /bundles, (b) an absolute path under /bundles, or (c) the path/name returned by `prepare_upload`. If the bundle lives only on the user's local machine, call `prepare_upload` FIRST.",
+        "Open and index a support bundle. Returns immediately; poll cluster_status when status=loading.",
       inputSchema: {
-        bundle_path: z
-          .string()
-          .describe(
-            "Filename in /bundles (e.g. 'support-2025-04-01.tar.gz'), absolute path under /bundles, or the 'path'/'name' returned by prepare_upload.",
-          ),
+        bundle_path: z.string().describe("Bundle filename, or an absolute path returned by upload."),
       },
     },
     async ({ bundle_path }) => safeRun("start_bundle", async () => {
@@ -139,259 +131,131 @@ export function createServer(): McpServer {
       } catch (err) {
         return errorResult(err instanceof Error ? err.message : String(err));
       }
-      if (!existsSync(resolved)) {
-        return errorResult([
-          `Bundle file not found on the MCP server at: ${resolved}`,
-          "",
-          "Next steps:",
-          `  - If the bundle is on the user's local machine, call prepare_upload first`,
-          `    (returns JSON with OS-specific upload commands targeting ${UPLOAD_DIR}).`,
-          `  - If the bundle should already be on the server, call list_bundles to see`,
-          `    what's actually available in ${BUNDLES_DIR}.`,
-        ].join("\n"));
+      if (!bundleExists(resolved)) {
+        return errorResult(
+          `Bundle not found at ${resolved}. Use list_bundles or prepare_upload first.`,
+        );
       }
-
-      if (isBundleProcessRunning()) {
-        if (currentBundlePath === resolved && bundleReady) {
-          return textResult(`status=ready. Bundle '${resolved}' is already loaded at ${PROXY_ADDRESS}.`);
-        }
-        if (currentBundlePath === resolved && bundleLoading) {
-          return textResult(
-            `status=loading. Bundle '${resolved}' is already being loaded. Poll cluster_status every few seconds until it reports ready.`,
-          );
-        }
-        log(`[MCP] Switching bundles: '${currentBundlePath}' → '${resolved}'`);
+      if (currentBundlePath === resolved && bundleReady) {
+        return textResult(`status=ready. Bundle '${resolved}' is already open.`);
+      }
+      if (currentBundlePath === resolved && bundleLoading) {
+        return textResult(`status=loading, phase=${bundlePhase}. Poll cluster_status.`);
+      }
+      if (isBundleActive()) {
+        log(`[MCP] Switching bundles: '${currentBundlePath}' -> '${resolved}'`);
         await stopBundle();
       }
-
-      markLoading();
-      let generation: number;
-      try {
-        // Resolves once the child spawns; loading continues in the background.
-        generation = await startBundle(resolved);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        markFailed(msg);
-        return errorResult(`Failed to start troubleshoot-live: ${msg}`);
-      }
-
-      // Watch in background so we return immediately and avoid tool-call timeouts.
-      const startedFor = resolved;
-      void (async () => {
-        log("[MCP] Waiting for Kubernetes API to become ready…");
-        const ok = await waitForCluster();
-        if (ok) {
-          markReady(startedFor, generation);
-        } else {
-          await abortTimedOutBundle(startedFor, generation);
-        }
-      })();
-
-      return textResult(
-        `status=loading, phase=${bundlePhase}. Bundle '${resolved}' is starting. Poll cluster_status every few seconds until it reports ready before using other inspection tools.`,
-      );
+      const status = await startBundle(resolved);
+      return status === "ready"
+        ? textResult(`status=ready. Bundle '${resolved}' opened from cache.`)
+        : textResult(`status=loading, phase=${bundlePhase}. Poll cluster_status until ready.`);
     }),
   );
 
   server.registerTool(
     "stop_bundle",
-    {
-      description:
-        "Unload the currently loaded support bundle and shut down the in-memory cluster. The MCP server itself stays up.",
-    },
+    { description: "Close the active support bundle." },
     async () => safeRun("stop_bundle", async () => {
-      if (!isBundleProcessRunning()) {
-        return textResult("No bundle is currently loaded.");
-      }
-      const wasLoaded = currentBundlePath;
+      if (!isBundleActive()) return textResult("No bundle is currently open.");
+      const path = currentBundlePath;
       await stopBundle();
-      return textResult(`Unloaded bundle '${wasLoaded}'. Use start_bundle to load another.`);
-    }),
-  );
-
-  server.registerTool(
-    "list_bundles",
-    {
-      description: `List support bundles available under ${BUNDLES_DIR}. Returns filenames you can pass to start_bundle.`,
-    },
-    async () => safeRun("list_bundles", async () => {
-      const files = listBundleFiles();
-      if (files.length === 0) {
-        return textResult(
-          `No bundles found in ${BUNDLES_DIR}.\n` +
-            `If the user has a bundle on their local machine, call prepare_upload to ` +
-            `upload it. Otherwise drop .tar.gz support bundles into the host directory ` +
-            `mounted at ${BUNDLES_DIR}.`,
-        );
-      }
-      const lines = files.map((f) => {
-        const sizeMb = (f.sizeBytes / 1024 / 1024).toFixed(1);
-        const active = f.path === currentBundlePath ? "  ← currently loaded" : "";
-        return `${f.path}\t${sizeMb} MB\t${f.modified}${active}`;
-      });
-      return textResult([
-        `Found ${files.length} bundle(s) in ${BUNDLES_DIR}:`,
-        "",
-        "PATH\tSIZE\tMODIFIED",
-        ...lines,
-      ].join("\n"));
+      return textResult(`Closed bundle '${path}'.`);
     }),
   );
 
   server.registerTool(
     "cluster_status",
     {
-      description:
-        "Report the cluster's load state. Use this to poll after start_bundle. Returns one of: status=ready (use inspection tools now), status=loading (poll again in a few seconds; includes a `phase` field), status=failed (load crashed; includes reason), status=idle (no bundle loaded).",
+      description: "Report bundle extraction/indexing state and available resource kinds.",
+      annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async () => safeRun("cluster_status", async () => {
       if (bundleReady) {
         return textResult(
-          `status=ready, phase=ready\nLoaded bundle: ${currentBundlePath}\n\n` +
-            (await runKubectl(["get", "namespaces"])),
+          `status=ready, phase=ready\nBundle: ${currentBundlePath}\nKinds: ${availableKinds().join(", ")}`,
         );
       }
       if (bundleLoading) {
         return textResult(
           `status=loading, phase=${bundlePhase}, elapsed=${elapsedSeconds(bundleLoadStartedAt)}s, ` +
-            `phaseElapsed=${elapsedSeconds(bundlePhaseStartedAt)}s\n` +
-            `Loading bundle: ${currentBundlePath}\n${PHASE_HINTS[bundlePhase]}`,
+          `phaseElapsed=${elapsedSeconds(bundlePhaseStartedAt)}s\nBundle: ${currentBundlePath}`,
         );
       }
-      if (bundleLoadError) {
-        return errorResult(
-          `status=failed, phase=failed\nLast load error:\n${bundleLoadError}\n` +
-            "Do not retry the same bundle automatically.",
-        );
-      }
-      return textResult(
-        "status=idle, phase=idle\nNo bundle loaded. Use list_bundles to see available bundles, then start_bundle to load one.",
-      );
+      if (bundleLoadError) return errorResult(`status=failed\n${bundleLoadError}`);
+      return textResult("status=idle, phase=idle\nUse list_bundles, then start_bundle.");
     }),
   );
-
-  // ── Batched triage ─────────────────────────────────────────────────────
 
   server.registerTool(
     "cluster_overview",
     {
       description:
-        "Batch tool: returns nodes, namespaces, not-ready pods across all namespaces, and recent Warning events in a single call. Use this FIRST for general triage — it saves 4 round-trips and caches all results for follow-up calls.",
+        "First-pass triage: nodes, namespaces, not-ready pods, Warning events, and parse diagnostics.",
       inputSchema: {
-        warning_event_limit: z
-          .number()
-          .int()
-          .positive()
-          .max(500)
-          .optional()
-          .describe("Cap on Warning events to include (default 50)."),
+        warning_event_limit: z.number().int().positive().max(500).optional(),
       },
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
-    async ({ warning_event_limit }) => readyTool("cluster_overview", async () => {
-      const [nodes, namespaces, notReadyPods, warnEvents] = await Promise.all([
-        runKubectl(["get", "nodes", "-o", "wide"]),
-        runKubectl(["get", "namespaces"]),
-        runKubectl([
-          "get", "pods", "-A", "-o", "wide",
-          "--field-selector=status.phase!=Running,status.phase!=Succeeded",
-        ]),
-        runKubectl([
-          "get", "events", "-A",
-          "--field-selector=type=Warning",
-          "--sort-by=.lastTimestamp",
-        ]),
-      ]);
-      const cap = warning_event_limit ?? 50;
-      // Keep the header row and last `cap` data rows; slicing from the end alone would drop the header.
-      const warnLines = warnEvents.split("\n");
-      const [warnHeader, ...warnRows] = warnLines;
-      const trimmedWarn =
-        warnRows.length <= cap
-          ? warnEvents
-          : [warnHeader, ...warnRows.slice(-cap)].join("\n");
-      return textResult([
-        "=== NODES ===",
-        nodes,
-        "",
-        "=== NAMESPACES ===",
-        namespaces,
-        "",
-        "=== NOT-READY PODS (all namespaces) ===",
-        notReadyPods || "(none)",
-        "",
-        `=== WARNING EVENTS (last ${cap}) ===`,
-        trimmedWarn || "(none)",
-      ].join("\n"));
-    }),
+    async ({ warning_event_limit }) => readyTool("cluster_overview", async () =>
+      textResult(withSizeHint(JSON.stringify(await bundleOverview(warning_event_limit ?? 50), null, 2)))),
   );
 
-  // ── Targeted queries ───────────────────────────────────────────────────
+  server.registerTool(
+    "resource_query",
+    {
+      description:
+        "Query Kubernetes resources directly from the bundle. Exact structured filters replace kubectl syntax. Summary output is default; use full=true for complete objects.",
+      inputSchema: {
+        kind: z.string().min(1).describe("Resource kind, e.g. Pod, Deployment, Event, or a CR kind."),
+        api_version: z.string().optional(),
+        namespace: z.string().optional(),
+        name: z.string().optional(),
+        labels: z.record(z.string()).optional().describe("Exact metadata label matches."),
+        fields: z.record(z.string()).optional().describe("Exact dot-path matches, e.g. status.phase."),
+        limit: z.number().int().positive().max(500).optional(),
+        full: z.boolean().optional().describe("Return complete collected objects instead of summaries."),
+      },
+      annotations: { readOnlyHint: true, idempotentHint: true },
+    },
+    async ({ kind, api_version, namespace, name, labels, fields, limit, full }) =>
+      readyTool("resource_query", async () => {
+        try {
+          const result = await queryResources({
+            kind,
+            apiVersion: api_version,
+            namespace,
+            name,
+            labels,
+            fields,
+            limit,
+            full,
+          });
+          return textResult(withSizeHint(JSON.stringify(result, null, 2)));
+        } catch (err) {
+          return errorResult(err instanceof Error ? err.message : String(err));
+        }
+      }),
+  );
 
   server.registerTool(
-    "kubectl_run",
+    "pod_logs",
     {
-      description: `Run a read-only kubectl command. The first argument must be one of: ${[
-        ...READ_ONLY_VERBS,
-      ]
-        .sort()
-        .join(", ")}. Mutating verbs (apply, delete, edit, patch, exec, cp, drain, scale, etc.) are rejected. Do not include the 'kubectl' prefix. Shell pipes (|) and operators are NOT supported — use --selector, --field-selector, or the 'grep' parameter to filter output instead.`,
+      description: "Read collected container logs from either standard support-bundle log layout.",
       inputSchema: {
-        args: z
-          .string()
-          .min(1)
-          .max(4096)
-          .describe(
-            "kubectl arguments, e.g. 'get nodes -o yaml' or 'top pods -A' or 'api-resources'",
-          ),
-        grep: z
-          .string()
-          .optional()
-          .describe(
-            "Filter output lines to those matching this string or regex pattern. Applied after kubectl runs. Use instead of shell pipes.",
-          ),
-        grep_ignore_case: z
-          .boolean()
-          .optional()
-          .describe("If true, the grep filter is case-insensitive (default false)."),
+        namespace: z.string().min(1),
+        pod: z.string().min(1),
+        container: z.string().min(1),
+        tail: z.number().int().positive().max(10_000).optional(),
       },
+      annotations: { readOnlyHint: true, idempotentHint: true },
     },
-    async ({ args, grep, grep_ignore_case }) => readyTool("kubectl_run", async () => {
-      let tokens: string[];
+    async ({ namespace, pod, container, tail }) => readyTool("pod_logs", async () => {
       try {
-        tokens = tokenize(args);
+        return textResult(withSizeHint(await readPodLogs(namespace, pod, container, tail ?? 200)));
       } catch (err) {
-        return errorResult(`Error parsing args: ${err instanceof Error ? err.message : String(err)}`);
+        return errorResult(err instanceof Error ? err.message : String(err));
       }
-      if (tokens.length === 0) {
-        return errorResult("Error: no kubectl command provided");
-      }
-      if (tokens.length > 64) {
-        return errorResult("Error: too many arguments (max 64).");
-      }
-      const verb = tokens[0]!.toLowerCase();
-      if (!READ_ONLY_VERBS.has(verb)) {
-        return errorResult(
-          `Refused: '${verb}' is not in the read-only allowlist. Allowed verbs: ${[
-            ...READ_ONLY_VERBS,
-          ]
-            .sort()
-            .join(", ")}.`,
-        );
-      }
-      let output = await runKubectl(tokens);
-      if (grep) {
-        let pattern: RegExp;
-        try {
-          pattern = new RegExp(grep, grep_ignore_case ? "i" : "");
-        } catch {
-          return errorResult(`Invalid grep pattern: ${grep}`);
-        }
-        const lines = output.split("\n");
-        const filtered = lines.filter((line) => pattern.test(line));
-        output = filtered.length > 0 ? filtered.join("\n") : "(no lines matched filter)";
-      }
-      return textResult(output);
     }),
   );
 
