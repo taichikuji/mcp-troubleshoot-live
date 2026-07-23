@@ -36,17 +36,11 @@ import { uploadBaseUrl } from "./request-context.js";
 import { cmdQuote, listBundleFiles, posixShellQuote, sanitizeFilename } from "./uploads.js";
 
 const INSTRUCTIONS = [
-  "WORKFLOW:",
-  "1. Call list_bundles. If the requested bundle is absent, use prepare_upload and run its returned command.",
-  "2. Call start_bundle. If it reports loading, poll cluster_status until ready.",
-  "3. Use cluster_overview first for general triage.",
-  "4. Use resource_catalog for collected kinds and Kubernetes aliases.",
-  "5. Use resource_query for structured Kubernetes selectors and pod_logs for pageable multi-container logs/search.",
-  "6. Use bundle_files only for diagnostics not represented as Kubernetes resources or pod logs.",
-  "7. Use full=true only when needed; narrow queries and follow nextOffset for more results.",
-  "8. Call stop_bundle when done.",
-  "",
-  "The tools read the immutable support bundle directly. There is no live cluster and no kubectl.",
+  "OPEN: list_bundles -> prepare_upload if absent -> start_bundle -> cluster_status until ready.",
+  "TRIAGE: cluster_overview first.",
+  "DETAIL: resource_query or pod_logs. Use resource_catalog only if kind is unknown; bundle_files last.",
+  "PAGE: follow nextOffset/nextLineOffset. Use full=true only when needed.",
+  "FINISH: stop_bundle. Data is a static snapshot, not a live cluster.",
 ].join("\n");
 
 const elapsedSeconds = (since: number | null): number =>
@@ -83,7 +77,7 @@ export function createServer(): McpServer {
     "prepare_upload",
     {
       description:
-        "Prepare an upload command for a support bundle on the user's machine. Call list_bundles first.",
+        "Return upload commands for a local support bundle missing from list_bundles.",
       inputSchema: {
         local_path: z.string().describe("Absolute local path to a .tar.gz, .tgz, or .tar bundle."),
       },
@@ -113,7 +107,7 @@ export function createServer(): McpServer {
   server.registerTool(
     "list_bundles",
     {
-      description: `List support bundles available under ${BUNDLES_DIR}.`,
+      description: `List support-bundle paths available under ${BUNDLES_DIR}.`,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async () => safeRun("list_bundles", async () => {
@@ -137,7 +131,7 @@ export function createServer(): McpServer {
     "start_bundle",
     {
       description:
-        "Open and index a support bundle. Returns immediately; poll cluster_status when status=loading.",
+        "Open and index one bundle. If status=loading, poll cluster_status.",
       inputSchema: {
         bundle_path: z.string().describe("Bundle filename, or an absolute path returned by upload."),
       },
@@ -155,7 +149,7 @@ export function createServer(): McpServer {
         );
       }
       if (currentBundlePath === resolved && bundleReady) {
-        return textResult(`status=ready. Bundle '${resolved}' is already open.`);
+        return textResult(`status=ready, next=cluster_overview\nBundle: ${resolved}`);
       }
       if (currentBundlePath === resolved && bundleLoading) {
         return textResult(`status=loading, phase=${bundlePhase}. Poll cluster_status.`);
@@ -166,7 +160,7 @@ export function createServer(): McpServer {
       }
       const status = await startBundle(resolved);
       return status === "ready"
-        ? textResult(`status=ready. Bundle '${resolved}' opened from cache.`)
+        ? textResult(`status=ready, next=cluster_overview\nBundle: ${resolved}`)
         : textResult(`status=loading, phase=${bundlePhase}. Poll cluster_status until ready.`);
     }),
   );
@@ -185,14 +179,14 @@ export function createServer(): McpServer {
   server.registerTool(
     "cluster_status",
     {
-      description: "Report bundle extraction/indexing state and available resource kinds.",
+      description: "Check bundle loading state. Poll after start_bundle until status=ready.",
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async () => safeRun("cluster_status", async () => {
       if (bundleReady) {
         return textResult(
-          `status=ready, phase=ready\nBundle: ${currentBundlePath}\n` +
-          `Collected kinds: ${availableKinds().length}. Use resource_catalog to discover them.`,
+          `status=ready, phase=ready, next=cluster_overview\nBundle: ${currentBundlePath}\n` +
+          `Collected kinds: ${availableKinds().length}`,
         );
       }
       if (bundleLoading) {
@@ -202,7 +196,7 @@ export function createServer(): McpServer {
         );
       }
       if (bundleLoadError) return errorResult(`status=failed\n${bundleLoadError}`);
-      return textResult("status=idle, phase=idle\nUse list_bundles, then start_bundle.");
+      return textResult("status=idle, phase=idle, next=list_bundles");
     }),
   );
 
@@ -210,7 +204,7 @@ export function createServer(): McpServer {
     "cluster_overview",
     {
       description:
-        "First-pass triage: nodes, namespaces, not-ready pods, Warning events, and parse diagnostics.",
+        "Summarize nodes, namespaces, unhealthy pods, Warning events, and parse diagnostics. Use first.",
       inputSchema: {
         warning_event_limit: z.number().int().positive().max(500).optional(),
       },
@@ -224,7 +218,7 @@ export function createServer(): McpServer {
     "resource_catalog",
     {
       description:
-        "Discover resource kinds, API versions, and accepted aliases collected in the active bundle. Use this before guessing version-specific CR names.",
+        "List collected resource kinds, API versions, and aliases. Use only when kind is unknown.",
       inputSchema: {
         search: z.string().optional().describe("Optional kind, API group/version, or alias substring."),
       },
@@ -238,7 +232,7 @@ export function createServer(): McpServer {
     "resource_query",
     {
       description:
-        "Query Kubernetes resources directly from the bundle. Exact structured filters replace kubectl syntax. Summary output is default; use full=true for complete objects.",
+        "Get collected Kubernetes resources with structured filters. Returns summaries by default; full=true returns complete objects.",
       inputSchema: {
         kind: z.string().min(1).describe("Resource kind, e.g. Pod, Deployment, Event, or a CR kind."),
         api_version: z.string().optional(),
@@ -318,7 +312,7 @@ export function createServer(): McpServer {
     "pod_logs",
     {
       description:
-        "Read or search every collected current/previous pod log by namespace, pod, container, or pod labels. Supports file and line pagination.",
+        "Get or search collected pod logs by namespace, pod, container, or labels. Supports previous logs and pagination.",
       inputSchema: {
         namespace: z.string().min(1).optional(),
         pod: z.string().min(1).optional(),
@@ -398,7 +392,7 @@ export function createServer(): McpServer {
     "bundle_files",
     {
       description:
-        "List, read, or literal-search raw support-bundle files not represented by resource_query or pod_logs. Reads and searches are bounded.",
+        "List, read, or search raw diagnostics not available through resource_query or pod_logs. Use last.",
       inputSchema: {
         operation: z.enum(["list", "read", "search"]),
         path: z.string().optional().describe("Relative file path for read, or path prefix for list/search."),
