@@ -33,6 +33,9 @@ export type ResourceQuery = {
   labels?: Record<string, string>;
   fields?: Record<string, string>;
   fieldContains?: Record<string, string>;
+  owner?: string;
+  sortBy?: string;
+  sortDesc?: boolean;
   offset?: number;
   limit?: number;
   full?: boolean;
@@ -55,6 +58,7 @@ export type PodLogQuery = {
   labels?: Record<string, string>;
   search?: string;
   ignoreCase?: boolean;
+  previous?: boolean;
   tail?: number;
   limit?: number;
 };
@@ -322,6 +326,35 @@ export class BundleReader {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
       }
     }
+    await this.addCrdAliases();
+  }
+
+  private async addCrdAliases(): Promise<void> {
+    const crdSources = this.sources.get(normalizeKind("CustomResourceDefinition"));
+    if (!crdSources) return;
+    for (const source of crdSources) {
+      for (const crd of await this.load(source)) {
+        const spec = asObject(crd.spec);
+        const names = asObject(spec?.names);
+        const kind = typeof names?.kind === "string" ? names.kind : "";
+        const targets = this.sources.get(normalizeKind(kind));
+        if (!targets) continue;
+        const group = typeof spec?.group === "string" ? spec.group : "";
+        const namesAndAliases = [
+          names?.plural,
+          names?.singular,
+          ...(Array.isArray(names?.shortNames) ? names.shortNames : []),
+        ].filter((value): value is string => typeof value === "string" && value.length > 0);
+        if (group) {
+          namesAndAliases.push(...namesAndAliases.slice(0, 2).map((name) => `${name}.${group}`));
+        }
+        for (const alias of namesAndAliases.map(normalizeKind)) {
+          const entries = this.sources.get(alias) ?? new Set<ResourceSource>();
+          for (const target of targets) entries.add(target);
+          this.sources.set(alias, entries);
+        }
+      }
+    }
   }
 
   private async load(source: ResourceSource): Promise<KubeObject[]> {
@@ -447,8 +480,25 @@ export class BundleReader {
             !String(nested(object, key) ?? "").includes(value)
           )
         ) continue;
+        if (query.owner) {
+          const owners = meta.ownerReferences;
+          if (
+            !Array.isArray(owners) ||
+            !owners.some((owner) => {
+              const reference = asObject(owner);
+              return reference?.name === query.owner || reference?.uid === query.owner;
+            })
+          ) continue;
+        }
         matches.push(object);
       }
+    }
+    if (query.sortBy) {
+      matches.sort((a, b) => {
+        const comparison = String(nested(a, query.sortBy!) ?? "")
+          .localeCompare(String(nested(b, query.sortBy!) ?? ""), undefined, { numeric: true });
+        return query.sortDesc ? -comparison : comparison;
+      });
     }
 
     const items = matches
@@ -482,10 +532,17 @@ export class BundleReader {
     return summary;
   }
 
-  async podLogs(namespace: string, pod: string, container: string, tail = 200): Promise<string> {
+  async podLogs(
+    namespace: string,
+    pod: string,
+    container: string,
+    tail = 200,
+    previous = false,
+  ): Promise<string> {
+    const suffix = `${container}${previous ? "-previous" : ""}.log`;
     const candidates = [
-      join(this.root, "pod-logs", namespace, `${pod}-${container}.log`),
-      join(this.root, "cluster-resources", "pods", "logs", namespace, pod, `${container}.log`),
+      join(this.root, "pod-logs", namespace, `${pod}-${suffix}`),
+      join(this.root, "cluster-resources", "pods", "logs", namespace, pod, suffix),
     ];
     let data: string | null = null;
     for (const path of candidates) {
@@ -557,6 +614,7 @@ export class BundleReader {
           candidate.pod,
           candidate.container,
           query.search ? 10_000 : tail,
+          query.previous,
         );
         if (query.search) {
           const needle = query.ignoreCase === false ? query.search : query.search.toLowerCase();

@@ -52,9 +52,13 @@ const INSTRUCTIONS = [
 const elapsedSeconds = (since: number | null): number =>
   since === null ? 0 : Math.max(0, Math.round((Date.now() - since) / 1000));
 
-const withSizeHint = (text: string): string => {
-  if (Buffer.byteLength(text) <= RESPONSE_SOFT_LIMIT_BYTES) return text;
-  return `${text}\n\n[note: large response; narrow resource_query by namespace, name, labels, or fields.]`;
+const boundedResult = (text: string): ToolResult => {
+  const bytes = Buffer.byteLength(text);
+  if (bytes <= RESPONSE_SOFT_LIMIT_BYTES) return textResult(text);
+  return errorResult(
+    `Response is ${Math.ceil(bytes / 1024)} KB, above the ` +
+    `${Math.ceil(RESPONSE_SOFT_LIMIT_BYTES / 1024)} KB safety limit. Narrow the query.`,
+  );
 };
 
 async function readyTool(name: string, fn: () => Promise<ToolResult>): Promise<ToolResult> {
@@ -179,7 +183,8 @@ export function createServer(): McpServer {
     async () => safeRun("cluster_status", async () => {
       if (bundleReady) {
         return textResult(
-          `status=ready, phase=ready\nBundle: ${currentBundlePath}\nKinds: ${availableKinds().join(", ")}`,
+          `status=ready, phase=ready\nBundle: ${currentBundlePath}\n` +
+          `Collected kinds: ${availableKinds().length}. Use resource_catalog to discover them.`,
         );
       }
       if (bundleLoading) {
@@ -204,7 +209,7 @@ export function createServer(): McpServer {
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ warning_event_limit }) => readyTool("cluster_overview", async () =>
-      textResult(withSizeHint(JSON.stringify(await bundleOverview(warning_event_limit ?? 50), null, 2)))),
+      boundedResult(JSON.stringify(await bundleOverview(warning_event_limit ?? 50), null, 2))),
   );
 
   server.registerTool(
@@ -218,7 +223,7 @@ export function createServer(): McpServer {
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
     async ({ search }) => readyTool("resource_catalog", async () =>
-      textResult(JSON.stringify(resourceCatalog(search), null, 2))),
+      boundedResult(JSON.stringify(resourceCatalog(search), null, 2))),
   );
 
   server.registerTool(
@@ -238,6 +243,9 @@ export function createServer(): McpServer {
         field_contains: z.record(z.string()).optional().describe(
           "Substring matches on dot-path values.",
         ),
+        owner: z.string().optional().describe("OwnerReference name or UID."),
+        sort_by: z.string().optional().describe("Dot path used to sort matching resources."),
+        sort_desc: z.boolean().optional(),
         offset: z.number().int().nonnegative().optional().describe(
           "Result offset. Use nextOffset from a truncated response.",
         ),
@@ -254,6 +262,9 @@ export function createServer(): McpServer {
       labels,
       fields,
       field_contains,
+      owner,
+      sort_by,
+      sort_desc,
       offset,
       limit,
       full,
@@ -268,11 +279,14 @@ export function createServer(): McpServer {
             labels,
             fields,
             fieldContains: field_contains,
+            owner,
+            sortBy: sort_by,
+            sortDesc: sort_desc,
             offset,
             limit,
             full,
           });
-          return textResult(withSizeHint(JSON.stringify(result, null, 2)));
+          return boundedResult(JSON.stringify(result, null, 2));
         } catch (err) {
           return errorResult(err instanceof Error ? err.message : String(err));
         }
@@ -291,27 +305,29 @@ export function createServer(): McpServer {
         labels: z.record(z.string()).optional().describe("Exact pod label matches."),
         search: z.string().min(1).optional().describe("Literal text to find in collected logs."),
         ignore_case: z.boolean().optional().describe("Case-insensitive search; default true."),
+        previous: z.boolean().optional().describe("Read collected previous-container logs."),
         tail: z.number().int().positive().max(10_000).optional(),
         limit: z.number().int().positive().max(100).optional().describe("Maximum log files returned."),
       },
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
-    async ({ namespace, pod, container, labels, search, ignore_case, tail, limit }) =>
+    async ({ namespace, pod, container, labels, search, ignore_case, previous, tail, limit }) =>
       readyTool("pod_logs", async () => {
         if (!pod && !labels) {
           return errorResult("Provide pod or labels to bound the log query.");
         }
         try {
-          return textResult(withSizeHint(JSON.stringify(await queryPodLogs({
+          return boundedResult(JSON.stringify(await queryPodLogs({
             namespace,
             pod,
             container,
             labels,
             search,
             ignoreCase: ignore_case,
+            previous,
             tail,
             limit,
-          }), null, 2)));
+          }), null, 2));
         } catch (err) {
           return errorResult(err instanceof Error ? err.message : String(err));
         }
@@ -341,18 +357,18 @@ export function createServer(): McpServer {
           }
           if (operation === "read") {
             if (!path) return errorResult("path is required for operation=read");
-            return textResult(withSizeHint(JSON.stringify(
+            return boundedResult(JSON.stringify(
               await readBundleContents(path, max_bytes),
               null,
               2,
-            )));
+            ));
           }
           if (!query) return errorResult("query is required for operation=search");
-          return textResult(withSizeHint(JSON.stringify(
+          return boundedResult(JSON.stringify(
             await searchBundleContents(query, path, limit, ignore_case),
             null,
             2,
-          )));
+          ));
         } catch (err) {
           return errorResult(err instanceof Error ? err.message : String(err));
         }

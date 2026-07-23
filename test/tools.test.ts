@@ -159,6 +159,9 @@ describe("structured bundle tools", () => {
       labels: { app: "web" },
       fields: { "status.phase": "Running" },
       fieldContains: { "metadata.name": "web" },
+      owner: undefined,
+      sortBy: undefined,
+      sortDesc: undefined,
       offset: 2,
       limit: 1,
       full: true,
@@ -181,6 +184,7 @@ describe("structured bundle tools", () => {
       labels: { app: "web" },
       search: "404",
       ignoreCase: undefined,
+      previous: undefined,
       tail: 50,
       limit: undefined,
     });
@@ -199,6 +203,24 @@ describe("structured bundle tools", () => {
     }) as { content: { text: string }[] };
     expect(JSON.parse(files.content[0]!.text).total).toBe(1);
     expect(mocks.listFiles).toHaveBeenCalledWith("host-collectors", undefined);
+  });
+
+  it("rejects oversized tool responses before they flood client context", async () => {
+    mocks.query.mockResolvedValue({
+      kind: "Pod",
+      total: 1,
+      offset: 0,
+      returned: 1,
+      truncated: false,
+      items: [{ data: "x".repeat(100_000) }],
+    });
+
+    const result = await invoke(tool("resource_query"), {
+      kind: "Pod",
+      full: true,
+    }) as { content: { text: string }[]; isError?: boolean };
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain("safety limit");
   });
 });
 

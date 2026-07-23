@@ -55,7 +55,7 @@ The server exposes 10 tools:
 | `cluster_overview` | Return nodes, namespaces, not-ready pods, Warning events, and parse diagnostics. |
 | `resource_catalog` | Discover collected kinds, API versions, and accepted aliases. |
 | `resource_query` | Query and paginate resources by kind, namespace, labels, and dot-path fields. |
-| `pod_logs` | Read/search logs by exact pod or pod labels across collected containers. |
+| `pod_logs` | Read/search current or previous logs by exact pod or pod labels across containers. |
 | `bundle_files` | List, read, or literal-search bounded raw diagnostic files. |
 
 Use `resource_catalog` before guessing version-specific CR names. `resource_query` returns compact
@@ -63,6 +63,8 @@ summaries by default and a `nextOffset` when more results exist. Set `full=true`
 complete collected object is needed. The reader supports JSON and YAML resources, missing-GVK
 inference for standard Troubleshoot paths, configmaps/secrets, nested List resources, and both
 pod-log layouts used by Troubleshoot.
+
+Tool responses above 200 KB are rejected with a narrowing hint instead of flooding client context.
 
 ## Configuration
 

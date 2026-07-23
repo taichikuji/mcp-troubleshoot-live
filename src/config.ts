@@ -23,5 +23,5 @@ export const MAX_ARCHIVE_FILES = intEnv("MAX_ARCHIVE_FILES", 500_000);
 // Normally derived per-request from Host + X-Forwarded-*; set this to pin it.
 export const PUBLIC_URL_OVERRIDE = (process.env.PUBLIC_URL ?? "").trim() || null;
 
-// Responses over this size get a "narrow your query" hint appended; nothing is truncated.
+// Responses over this size are rejected so one tool call cannot exhaust client context.
 export const RESPONSE_SOFT_LIMIT_BYTES = intEnv("RESPONSE_SOFT_LIMIT_BYTES", 200 * 1024);

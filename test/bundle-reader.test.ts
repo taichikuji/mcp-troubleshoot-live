@@ -58,6 +58,15 @@ async function fixture(): Promise<{ reader: BundleReader; dir: string }> {
       reason: "FailedScheduling",
       lastTimestamp: "2026-07-23T10:00:00Z",
     }]),
+    "fixture/cluster-resources/custom-resource-definitions.json": list([{
+      apiVersion: "apiextensions.k8s.io/v1",
+      kind: "CustomResourceDefinition",
+      metadata: { name: "gadgets.example.test" },
+      spec: {
+        group: "example.test",
+        names: { kind: "Gadget", plural: "gadgets", singular: "gadget", shortNames: ["gd"] },
+      },
+    }]),
     "fixture/cluster-resources/widgets/default.json": list([{
       apiVersion: "example.test/v1",
       kind: "Widget",
@@ -86,6 +95,7 @@ async function fixture(): Promise<{ reader: BundleReader; dir: string }> {
     }),
     "fixture/pod-logs/default/web-0-app.log": "one\ntwo\nthree\n",
     "fixture/cluster-resources/pods/logs/default/worker-0/worker.log": "alpha\nbeta\n",
+    "fixture/cluster-resources/pods/logs/default/worker-0/worker-previous.log": "old failure\n",
     "fixture/host-collectors/system/node-1/cpu.txt": "CPU healthy\nrequest failed with 404\n",
   });
   const extraction = join(dir, "extracted");
@@ -133,6 +143,9 @@ describe("BundleReader", () => {
       total: 1,
       items: [expect.objectContaining({ kind: "Gadget" })],
     });
+    await expect(reader.query({ kind: "gadgets.example.test" })).resolves.toMatchObject({
+      total: 1,
+    });
 
     const configMaps = await reader.query({ kind: "ConfigMap", name: "app", full: true });
     expect(configMaps.items[0]?.data).toEqual({ mode: "test" });
@@ -154,6 +167,14 @@ describe("BundleReader", () => {
     })).resolves.toMatchObject({
       matchedPods: 1,
       logs: [{ pod: "worker-0", container: "worker", text: "beta\n" }],
+    });
+    await expect(reader.queryPodLogs({
+      namespace: "default",
+      pod: "worker-0",
+      previous: true,
+      search: "failure",
+    })).resolves.toMatchObject({
+      logs: [{ pod: "worker-0", container: "worker", text: "old failure\n" }],
     });
   });
 
