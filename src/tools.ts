@@ -1,3 +1,5 @@
+import { existsSync } from "fs";
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
@@ -137,8 +139,7 @@ export function createServer(): McpServer {
       } catch (err) {
         return errorResult(err instanceof Error ? err.message : String(err));
       }
-      const fs = await import("fs");
-      if (!fs.existsSync(resolved)) {
+      if (!existsSync(resolved)) {
         return errorResult([
           `Bundle file not found on the MCP server at: ${resolved}`,
           "",

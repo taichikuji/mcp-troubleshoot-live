@@ -48,7 +48,7 @@ app.get("/health", (_req: Request, res: Response) => {
 
 async function main(): Promise<void> {
   initUploadDir();
-  try { rmSync(TROUBLESHOOT_LIVE_WORKDIR, { recursive: true, force: true }); } catch {}
+  rmSync(TROUBLESHOOT_LIVE_WORKDIR, { recursive: true, force: true });
 
   log(
     `[MCP] Upload dir: ${UPLOAD_DIR} (max ${(MAX_UPLOAD_BYTES / 1024 / 1024 / 1024).toFixed(1)} GB, TTL ${Math.round(UPLOAD_TTL_MS / 3_600_000)}h)`,

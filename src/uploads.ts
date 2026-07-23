@@ -33,7 +33,7 @@ export function cmdQuote(s: string): string {
 }
 
 export function initUploadDir(): void {
-  try { rmSync(UPLOAD_DIR, { recursive: true, force: true }); } catch {}
+  rmSync(UPLOAD_DIR, { recursive: true, force: true });
   mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
@@ -113,7 +113,7 @@ export function handleUpload(req: Request, res: Response): void {
   const abort = (status: number, message: string) => {
     if (aborted) return;
     aborted = true;
-    try { ws.destroy(); } catch {}
+    ws.destroy();
     try { unlinkSync(dest); } catch {}
     if (!res.headersSent) res.status(status).json({ error: message });
   };

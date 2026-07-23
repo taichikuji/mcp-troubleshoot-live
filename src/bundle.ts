@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "child_process";
-import { existsSync, rmSync, unlinkSync } from "fs";
+import { rmSync } from "fs";
 import { isAbsolute, join, resolve as resolvePath } from "path";
 
 import { cacheClear } from "./cache.js";
@@ -180,7 +180,7 @@ export async function stopBundle(timeoutMs = 10_000): Promise<void> {
       bundleLoadStartedAt = null;
       bundlePhaseStartedAt = null;
       cacheClear();
-      try { if (existsSync(KUBECONFIG_PATH)) unlinkSync(KUBECONFIG_PATH); } catch {}
+      try { rmSync(KUBECONFIG_PATH, { force: true }); } catch {}
       try { rmSync(TROUBLESHOOT_LIVE_WORKDIR, { recursive: true, force: true }); } catch {}
       maybeDeleteUpload(wasPath);
       resolve();
