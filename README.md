@@ -43,7 +43,7 @@ an API server boot, CRD establishment, object import, or an in-memory cluster.
 
 ## Tools
 
-The server exposes 8 tools:
+The server exposes 10 tools:
 
 | Tool | Purpose |
 | --- | --- |
@@ -53,12 +53,16 @@ The server exposes 8 tools:
 | `stop_bundle` | Close the active bundle and clean uploaded data. |
 | `cluster_status` | Report `idle`, `extracting`, `indexing`, `ready`, or `failed`. |
 | `cluster_overview` | Return nodes, namespaces, not-ready pods, Warning events, and parse diagnostics. |
-| `resource_query` | Query resources by kind, API version, namespace, name, exact labels, and dot-path fields. |
-| `pod_logs` | Read collected container logs with a tail limit. |
+| `resource_catalog` | Discover collected kinds, API versions, and accepted aliases. |
+| `resource_query` | Query and paginate resources by kind, namespace, labels, and dot-path fields. |
+| `pod_logs` | Read/search logs by exact pod or pod labels across collected containers. |
+| `bundle_files` | List, read, or literal-search bounded raw diagnostic files. |
 
-`resource_query` returns compact summaries by default. Set `full=true` only when the complete
-collected object is needed. The reader supports JSON and YAML resources, missing-GVK inference for
-standard Troubleshoot paths, configmaps/secrets, and both pod-log layouts used by Troubleshoot.
+Use `resource_catalog` before guessing version-specific CR names. `resource_query` returns compact
+summaries by default and a `nextOffset` when more results exist. Set `full=true` only when the
+complete collected object is needed. The reader supports JSON and YAML resources, missing-GVK
+inference for standard Troubleshoot paths, configmaps/secrets, nested List resources, and both
+pod-log layouts used by Troubleshoot.
 
 ## Configuration
 

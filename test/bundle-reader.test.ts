@@ -39,6 +39,7 @@ async function fixture(): Promise<{ reader: BundleReader; dir: string }> {
     "fixture/cluster-resources/pods/default.json": list([
       {
         metadata: { name: "web-0", namespace: "default", labels: { app: "web" } },
+        spec: { containers: [{ name: "app" }] },
         status: { phase: "Running", containerStatuses: [{ ready: true }] },
       },
       {
@@ -47,6 +48,7 @@ async function fixture(): Promise<{ reader: BundleReader; dir: string }> {
           namespace: "default",
           labels: { app: "worker", "app.kubernetes.io/name": "worker" },
         },
+        spec: { containers: [{ name: "worker" }] },
         status: { phase: "Pending", containerStatuses: [{ ready: false }] },
       },
     ]),
@@ -60,7 +62,17 @@ async function fixture(): Promise<{ reader: BundleReader; dir: string }> {
       apiVersion: "example.test/v1",
       kind: "Widget",
       metadata: { name: "sample", namespace: "default" },
+      spec: { rules: [{ matches: [{ header: "unified-enpoint-test" }] }] },
       status: { healthy: false },
+    }]),
+    "fixture/cluster-resources/gadgets/default.json": JSON.stringify([{
+      apiVersion: "example.test/v1",
+      kind: "GadgetList",
+      items: [{
+        apiVersion: "example.test/v1",
+        kind: "Gadget",
+        metadata: { name: "nested", namespace: "default" },
+      }],
     }]),
     "fixture/cluster-resources/custom/bad.json": "{broken",
     "fixture/configmaps/default/app.json": JSON.stringify({
@@ -74,6 +86,7 @@ async function fixture(): Promise<{ reader: BundleReader; dir: string }> {
     }),
     "fixture/pod-logs/default/web-0-app.log": "one\ntwo\nthree\n",
     "fixture/cluster-resources/pods/logs/default/worker-0/worker.log": "alpha\nbeta\n",
+    "fixture/host-collectors/system/node-1/cpu.txt": "CPU healthy\nrequest failed with 404\n",
   });
   const extraction = join(dir, "extracted");
   const reader = await BundleReader.open(path, extraction, () => {});
@@ -98,10 +111,28 @@ describe("BundleReader", () => {
     expect(pods.total).toBe(1);
     expect(pods.items[0]?.kind).toBe("Pod");
     expect(pods.items[0]?.apiVersion).toBe("v1");
+    const firstPage = await reader.query({ kind: "Pod", limit: 1 });
+    expect(firstPage).toMatchObject({ total: 2, offset: 0, truncated: true, nextOffset: 1 });
+    await expect(reader.query({ kind: "Pod", limit: 1, offset: firstPage.nextOffset }))
+      .resolves.toMatchObject({ total: 2, offset: 1, truncated: false });
 
     const widgets = await reader.query({ kind: "Widget", name: "sample", full: true });
     expect(widgets.total).toBe(1);
     expect(widgets.items[0]?.apiVersion).toBe("example.test/v1");
+    await expect(reader.query({
+      kind: "Widget",
+      fieldContains: { "spec.rules[0].matches[0].header": "enpoint" },
+    })).resolves.toMatchObject({ total: 1 });
+
+    expect(reader.resourceCatalog("gadget")).toEqual([{
+      kind: "Gadget",
+      apiVersion: "example.test/v1",
+      aliases: expect.arrayContaining(["gadget", "gadgets"]),
+    }]);
+    await expect(reader.query({ kind: "gadgets", full: true })).resolves.toMatchObject({
+      total: 1,
+      items: [expect.objectContaining({ kind: "Gadget" })],
+    });
 
     const configMaps = await reader.query({ kind: "ConfigMap", name: "app", full: true });
     expect(configMaps.items[0]?.data).toEqual({ mode: "test" });
@@ -116,6 +147,29 @@ describe("BundleReader", () => {
     expect(overview.warningEvents).toHaveLength(1);
     await expect(reader.podLogs("default", "web-0", "app", 2)).resolves.toBe("two\nthree\n");
     await expect(reader.podLogs("default", "worker-0", "worker", 1)).resolves.toBe("beta\n");
+    await expect(reader.queryPodLogs({
+      namespace: "default",
+      labels: { app: "worker" },
+      search: "BETA",
+    })).resolves.toMatchObject({
+      matchedPods: 1,
+      logs: [{ pod: "worker-0", container: "worker", text: "beta\n" }],
+    });
+  });
+
+  it("lists, reads, and searches bounded raw bundle files", async () => {
+    const { reader } = await fixture();
+
+    await expect(reader.listFiles("host-collectors")).resolves.toMatchObject({
+      total: 1,
+      files: [{ path: "host-collectors/system/node-1/cpu.txt" }],
+    });
+    await expect(reader.readBundleFile("host-collectors/system/node-1/cpu.txt")).resolves
+      .toMatchObject({ text: "CPU healthy\nrequest failed with 404\n", truncated: false });
+    await expect(reader.searchFiles("FAILED WITH 404", "host-collectors")).resolves.toMatchObject({
+      matches: [{ path: "host-collectors/system/node-1/cpu.txt", line: 2 }],
+    });
+    await expect(reader.readBundleFile("../outside")).rejects.toThrow("Unsafe bundle path");
   });
 
   it("rejects archive traversal before writing outside the destination", async () => {

@@ -2,7 +2,12 @@ import { existsSync, mkdirSync, rmSync } from "fs";
 import { stat } from "fs/promises";
 import { isAbsolute, join, resolve as resolvePath, sep } from "path";
 
-import { BundleReader, type ResourceQuery, type ResourceQueryResult } from "./bundle-reader.js";
+import {
+  BundleReader,
+  type PodLogQuery,
+  type ResourceQuery,
+  type ResourceQueryResult,
+} from "./bundle-reader.js";
 import { BUNDLE_CACHE_DIR, BUNDLES_DIR, UPLOAD_DIR } from "./config.js";
 import { errorResult, log, type ToolResult } from "./log.js";
 import { maybeDeleteUpload } from "./uploads.js";
@@ -183,9 +188,26 @@ export const readPodLogs = (
   tail: number,
 ): Promise<string> => reader().podLogs(namespace, pod, container, tail);
 
+export const queryPodLogs = (query: PodLogQuery) => reader().queryPodLogs(query);
+
 export const bundleOverview = (warningLimit: number): Promise<Record<string, unknown>> =>
   reader().overview(warningLimit);
 
 export const availableKinds = (): string[] => reader().availableKinds();
+
+export const resourceCatalog = (search?: string) => reader().resourceCatalog(search);
+
+export const listBundleContents = (prefix?: string, limit?: number) =>
+  reader().listFiles(prefix, limit);
+
+export const readBundleContents = (path: string, maxBytes?: number) =>
+  reader().readBundleFile(path, maxBytes);
+
+export const searchBundleContents = (
+  query: string,
+  prefix?: string,
+  limit?: number,
+  ignoreCase?: boolean,
+) => reader().searchFiles(query, prefix, limit, ignoreCase);
 
 export const bundleExists = (path: string): boolean => existsSync(path);

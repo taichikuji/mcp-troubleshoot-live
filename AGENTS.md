@@ -23,7 +23,7 @@ bundle-reader.ts secure extraction, resource catalog/query, logs
 uploads.ts       upload sanitization, sweeper, listBundleFiles, PUT handler
 request-context.ts  AsyncLocalStorage for per-request base URL
 bundle.ts        active reader lifecycle and bundle state
-tools.ts         createServer, all 8 tool registrations
+tools.ts         createServer, all 10 tool registrations
 transport.ts     Express routes
 index.ts         startup, /health, signal handling
 ```

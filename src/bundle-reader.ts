@@ -1,6 +1,7 @@
 import { createReadStream, createWriteStream } from "fs";
 import {
   mkdir,
+  open,
   readFile,
   readdir,
   rm,
@@ -31,6 +32,8 @@ export type ResourceQuery = {
   name?: string;
   labels?: Record<string, string>;
   fields?: Record<string, string>;
+  fieldContains?: Record<string, string>;
+  offset?: number;
   limit?: number;
   full?: boolean;
 };
@@ -38,9 +41,22 @@ export type ResourceQuery = {
 export type ResourceQueryResult = {
   kind: string;
   total: number;
+  offset: number;
   returned: number;
   truncated: boolean;
+  nextOffset?: number;
   items: KubeObject[];
+};
+
+export type PodLogQuery = {
+  namespace?: string;
+  pod?: string;
+  container?: string;
+  labels?: Record<string, string>;
+  search?: string;
+  ignoreCase?: boolean;
+  tail?: number;
+  limit?: number;
 };
 
 const SKIP_RESOURCE_FILES = new Set([
@@ -73,10 +89,14 @@ const asObject = (value: unknown): KubeObject | null =>
 
 const nested = (object: KubeObject, path: string): unknown => {
   let value: unknown = object;
-  for (const part of path.split(".")) {
-    const current = asObject(value);
-    if (!current) return undefined;
-    value = current[part];
+  for (const part of path.replace(/\[(\d+)\]/g, ".$1").split(".")) {
+    if (Array.isArray(value) && /^\d+$/.test(part)) {
+      value = value[Number(part)];
+    } else {
+      const current = asObject(value);
+      if (!current) return undefined;
+      value = current[part];
+    }
   }
   return value;
 };
@@ -92,11 +112,11 @@ const aliasesFor = (kind: string): string[] => {
 };
 
 const parseObjectList = (value: unknown): KubeObject[] => {
-  if (Array.isArray(value)) return value.map(asObject).filter((v): v is KubeObject => v !== null);
+  if (Array.isArray(value)) return value.flatMap(parseObjectList);
   const object = asObject(value);
   if (!object) return [];
   if (Array.isArray(object.items)) {
-    return object.items.map(asObject).filter((v): v is KubeObject => v !== null);
+    return object.items.flatMap(parseObjectList);
   }
   return object.metadata || object.apiVersion || object.kind ? [object] : [];
 };
@@ -273,13 +293,17 @@ export class BundleReader {
       }
 
       try {
-        const [first] = await parseResourceFile(path);
-        if (typeof first?.kind !== "string") continue;
-        this.addSource({
-          path,
-          kind: first.kind,
-          apiVersion: typeof first.apiVersion === "string" ? first.apiVersion : undefined,
-        }, rel.split("/")[0]);
+        const discovered = new Map<string, ResourceSource>();
+        for (const object of await parseResourceFile(path)) {
+          if (typeof object.kind !== "string") continue;
+          const apiVersion = typeof object.apiVersion === "string" ? object.apiVersion : undefined;
+          discovered.set(`${object.kind}|${apiVersion ?? ""}`, {
+            path,
+            kind: object.kind,
+            apiVersion,
+          });
+        }
+        for (const source of discovered.values()) this.addSource(source, rel.split("/")[0]);
       } catch (err) {
         this.diagnostics.push(`${rel}: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -343,18 +367,68 @@ export class BundleReader {
     return [...kinds].sort();
   }
 
+  resourceCatalog(search?: string): Array<{
+    kind: string;
+    apiVersion?: string;
+    aliases: string[];
+  }> {
+    const aliases = new Map<ResourceSource, Set<string>>();
+    for (const [alias, sources] of this.sources) {
+      for (const source of sources) {
+        const values = aliases.get(source) ?? new Set<string>();
+        values.add(alias);
+        aliases.set(source, values);
+      }
+    }
+    const unique = new Map<string, {
+      kind: string;
+      apiVersion?: string;
+      aliases: Set<string>;
+    }>();
+    for (const [source, sourceAliases] of aliases) {
+      const key = `${source.kind}|${source.apiVersion ?? ""}`;
+      const entry = unique.get(key) ?? {
+        kind: source.kind,
+        apiVersion: source.apiVersion,
+        aliases: new Set<string>(),
+      };
+      for (const alias of sourceAliases) entry.aliases.add(alias);
+      unique.set(key, entry);
+    }
+    const needle = normalizeKind(search ?? "");
+    return [...unique.values()]
+      .filter((entry) =>
+        !needle ||
+        normalizeKind(entry.kind).includes(needle) ||
+        normalizeKind(entry.apiVersion ?? "").includes(needle) ||
+        [...entry.aliases].some((alias) => alias.includes(needle))
+      )
+      .map((entry) => ({
+        kind: entry.kind,
+        apiVersion: entry.apiVersion,
+        aliases: [...entry.aliases].sort(),
+      }))
+      .sort((a, b) => a.kind.localeCompare(b.kind));
+  }
+
   async query(query: ResourceQuery): Promise<ResourceQueryResult> {
-    const sources = this.sources.get(normalizeKind(query.kind));
+    const requestedKind = normalizeKind(query.kind);
+    const sources = this.sources.get(requestedKind);
     if (!sources) {
+      const suggestions = this.resourceCatalog(query.kind).slice(0, 10).map((entry) => entry.kind);
       throw new Error(
-        `Unknown resource kind '${query.kind}'. Available kinds: ${this.availableKinds().join(", ")}`,
+        `Unknown resource kind '${query.kind}'.` +
+        (suggestions.length ? ` Possible matches: ${suggestions.join(", ")}.` : "") +
+        " Use resource_catalog to discover collected kinds and aliases.",
       );
     }
+    const offset = Math.max(query.offset ?? 0, 0);
     const limit = Math.min(Math.max(query.limit ?? 100, 1), 50_000);
     const matches: KubeObject[] = [];
 
     for (const source of sources) {
       for (const object of await this.load(source)) {
+        if (normalizeKind(String(object.kind ?? source.kind)) !== normalizeKind(source.kind)) continue;
         const meta = metadata(object);
         if (query.apiVersion && object.apiVersion !== query.apiVersion) continue;
         if (query.namespace && meta.namespace !== query.namespace) continue;
@@ -367,16 +441,27 @@ export class BundleReader {
           query.fields &&
           Object.entries(query.fields).some(([key, value]) => String(nested(object, key)) !== value)
         ) continue;
+        if (
+          query.fieldContains &&
+          Object.entries(query.fieldContains).some(([key, value]) =>
+            !String(nested(object, key) ?? "").includes(value)
+          )
+        ) continue;
         matches.push(object);
       }
     }
 
-    const items = matches.slice(0, limit).map((object) => query.full ? object : this.summarize(object));
+    const items = matches
+      .slice(offset, offset + limit)
+      .map((object) => query.full ? object : this.summarize(object));
+    const nextOffset = offset + items.length;
     return {
       kind: query.kind,
       total: matches.length,
+      offset,
       returned: items.length,
-      truncated: matches.length > items.length,
+      truncated: nextOffset < matches.length,
+      ...(nextOffset < matches.length ? { nextOffset } : {}),
       items,
     };
   }
@@ -420,11 +505,208 @@ export class BundleReader {
     return trailingNewline ? `${output}\n` : output;
   }
 
+  async queryPodLogs(query: PodLogQuery): Promise<{
+    matchedPods: number;
+    returned: number;
+    truncated: boolean;
+    logs: Array<{ namespace: string; pod: string; container: string; text: string }>;
+  }> {
+    const limit = Math.min(Math.max(query.limit ?? 20, 1), 100);
+    const tail = Math.min(Math.max(query.tail ?? 200, 1), 10_000);
+    const pods = await this.query({
+      kind: "Pod",
+      namespace: query.namespace,
+      name: query.pod,
+      labels: query.labels,
+      limit: 50_000,
+      full: true,
+    });
+    const candidates: Array<{ namespace: string; pod: string; container: string }> = [];
+    for (const podObject of pods.items) {
+      const meta = metadata(podObject);
+      const namespace = String(meta.namespace ?? "default");
+      const pod = String(meta.name ?? "");
+      const spec = asObject(podObject.spec) ?? {};
+      const containerNames = [
+        ...(Array.isArray(spec.initContainers) ? spec.initContainers : []),
+        ...(Array.isArray(spec.containers) ? spec.containers : []),
+        ...(Array.isArray(spec.ephemeralContainers) ? spec.ephemeralContainers : []),
+      ].map((container) => String(asObject(container)?.name ?? "")).filter(Boolean);
+      for (const container of query.container ? [query.container] : containerNames) {
+        candidates.push({ namespace, pod, container });
+      }
+    }
+    if (candidates.length === 0 && query.namespace && query.pod && query.container) {
+      candidates.push({
+        namespace: query.namespace,
+        pod: query.pod,
+        container: query.container,
+      });
+    }
+
+    const logs: Array<{ namespace: string; pod: string; container: string; text: string }> = [];
+    let truncated = false;
+    for (const candidate of candidates) {
+      if (logs.length >= limit) {
+        truncated = true;
+        break;
+      }
+      try {
+        let text = await this.podLogs(
+          candidate.namespace,
+          candidate.pod,
+          candidate.container,
+          query.search ? 10_000 : tail,
+        );
+        if (query.search) {
+          const needle = query.ignoreCase === false ? query.search : query.search.toLowerCase();
+          const lines = text.replace(/\r?\n$/, "").split(/\r?\n/).filter((line) => {
+            const candidateLine = query.ignoreCase === false ? line : line.toLowerCase();
+            return candidateLine.includes(needle);
+          });
+          text = lines.slice(-tail).join("\n");
+          if (text) text += "\n";
+        }
+        if (!query.search || text) logs.push({ ...candidate, text });
+      } catch (err) {
+        if (!(err instanceof Error) || !err.message.startsWith("Logs not found")) throw err;
+      }
+    }
+    return {
+      matchedPods: pods.total,
+      returned: logs.length,
+      truncated,
+      logs,
+    };
+  }
+
+  private resolveBundleFile(path: string): string {
+    if (!path || path.includes("\0") || path.includes("\\") || posix.isAbsolute(path)) {
+      throw new Error(`Unsafe bundle path: ${JSON.stringify(path)}`);
+    }
+    const normalized = posix.normalize(path).replace(/^\.\//, "");
+    if (!normalized || normalized === "." || normalized.split("/").includes("..")) {
+      throw new Error(`Unsafe bundle path: ${JSON.stringify(path)}`);
+    }
+    const absolute = resolve(this.root, normalized);
+    if (!absolute.startsWith(`${resolve(this.root)}${sep}`)) {
+      throw new Error(`Bundle path escapes bundle root: ${JSON.stringify(path)}`);
+    }
+    return absolute;
+  }
+
+  async listFiles(prefix = "", limit = 200): Promise<{
+    total: number;
+    returned: number;
+    truncated: boolean;
+    files: Array<{ path: string; sizeBytes: number }>;
+  }> {
+    const normalizedPrefix = prefix.replace(/^\/+/, "");
+    const paths = (await walkFiles(this.root))
+      .map((path) => relative(this.root, path).split(sep).join("/"))
+      .filter((path) => path.startsWith(normalizedPrefix))
+      .sort();
+    const selected = paths.slice(0, Math.min(Math.max(limit, 1), 500));
+    const files = await Promise.all(selected.map(async (path) => ({
+      path,
+      sizeBytes: (await stat(this.resolveBundleFile(path))).size,
+    })));
+    return {
+      total: paths.length,
+      returned: files.length,
+      truncated: paths.length > files.length,
+      files,
+    };
+  }
+
+  async readBundleFile(path: string, maxBytes = 200 * 1024): Promise<{
+    path: string;
+    sizeBytes: number;
+    truncated: boolean;
+    text: string;
+  }> {
+    const absolute = this.resolveBundleFile(path);
+    const info = await stat(absolute);
+    if (!info.isFile()) throw new Error(`Not a file: ${path}`);
+    const bytesToRead = Math.min(info.size, Math.min(Math.max(maxBytes, 1), 1024 * 1024));
+    const buffer = Buffer.alloc(bytesToRead);
+    const handle = await open(absolute, "r");
+    try {
+      const { bytesRead } = await handle.read(buffer, 0, bytesToRead, 0);
+      const content = buffer.subarray(0, bytesRead);
+      if (content.includes(0)) throw new Error(`Bundle file is binary: ${path}`);
+      return {
+        path,
+        sizeBytes: info.size,
+        truncated: info.size > bytesRead,
+        text: content.toString("utf8"),
+      };
+    } finally {
+      await handle.close();
+    }
+  }
+
+  async searchFiles(
+    query: string,
+    prefix = "",
+    limit = 100,
+    ignoreCase = true,
+  ): Promise<{
+    scannedFiles: number;
+    scannedBytes: number;
+    truncated: boolean;
+    matches: Array<{ path: string; line: number; text: string }>;
+  }> {
+    if (!query) throw new Error("Search query cannot be empty");
+    const normalizedPrefix = prefix.replace(/^\/+/, "");
+    const paths = (await walkFiles(this.root))
+      .map((path) => relative(this.root, path).split(sep).join("/"))
+      .filter((path) => path.startsWith(normalizedPrefix))
+      .sort();
+    const maxMatches = Math.min(Math.max(limit, 1), 500);
+    const needle = ignoreCase ? query.toLowerCase() : query;
+    const matches: Array<{ path: string; line: number; text: string }> = [];
+    let scannedFiles = 0;
+    let scannedBytes = 0;
+    let truncated = false;
+
+    for (const path of paths) {
+      const absolute = this.resolveBundleFile(path);
+      const info = await stat(absolute);
+      if (info.size > 2 * 1024 * 1024) continue;
+      if (scannedBytes + info.size > 64 * 1024 * 1024) {
+        truncated = true;
+        break;
+      }
+      const content = await readFile(absolute);
+      if (content.includes(0)) continue;
+      scannedFiles += 1;
+      scannedBytes += content.length;
+      for (const [index, line] of content.toString("utf8").split(/\r?\n/).entries()) {
+        const candidate = ignoreCase ? line.toLowerCase() : line;
+        if (!candidate.includes(needle)) continue;
+        matches.push({ path, line: index + 1, text: line.slice(0, 1000) });
+        if (matches.length >= maxMatches) {
+          truncated = true;
+          return { scannedFiles, scannedBytes, truncated, matches };
+        }
+      }
+    }
+    return { scannedFiles, scannedBytes, truncated, matches };
+  }
+
   async overview(warningLimit = 50): Promise<KubeObject> {
     const optionalQuery = (kind: string, full = false): Promise<ResourceQueryResult> =>
       this.sources.has(normalizeKind(kind))
         ? this.query({ kind, limit: 50_000, full })
-        : Promise.resolve({ kind, total: 0, returned: 0, truncated: false, items: [] });
+        : Promise.resolve({
+          kind,
+          total: 0,
+          offset: 0,
+          returned: 0,
+          truncated: false,
+          items: [],
+        });
     const [nodes, namespaces, pods, events] = await Promise.all([
       optionalQuery("Node"),
       optionalQuery("Namespace"),

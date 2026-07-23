@@ -2,10 +2,14 @@ import { z } from "zod";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
+  catalog: vi.fn(),
+  listFiles: vi.fn(),
   overview: vi.fn(),
   query: vi.fn(),
-  readLogs: vi.fn(),
+  queryLogs: vi.fn(),
+  readFile: vi.fn(),
   requireReady: vi.fn(),
+  searchFiles: vi.fn(),
   start: vi.fn(),
   stop: vi.fn(),
 }));
@@ -32,10 +36,14 @@ vi.mock("../src/bundle.js", () => ({
   get bundleReady() { return state.ready; },
   get currentBundlePath() { return state.path; },
   isBundleActive: () => state.loading || state.ready,
+  listBundleContents: mocks.listFiles,
+  queryPodLogs: mocks.queryLogs,
   queryResources: mocks.query,
-  readPodLogs: mocks.readLogs,
+  readBundleContents: mocks.readFile,
   requireReady: mocks.requireReady,
+  resourceCatalog: mocks.catalog,
   resolveBundlePath: (path: string) => path,
+  searchBundleContents: mocks.searchFiles,
   startBundle: mocks.start,
   stopBundle: mocks.stop,
 }));
@@ -96,11 +104,19 @@ beforeEach(async () => {
   mocks.query.mockResolvedValue({
     kind: "Pod",
     total: 1,
+    offset: 0,
     returned: 1,
     truncated: false,
     items: [{ kind: "Pod", metadata: { name: "web-0" } }],
   });
-  mocks.readLogs.mockResolvedValue("line\n");
+  mocks.queryLogs.mockResolvedValue({
+    matchedPods: 1,
+    returned: 1,
+    truncated: false,
+    logs: [{ namespace: "default", pod: "web-0", container: "app", text: "line\n" }],
+  });
+  mocks.catalog.mockReturnValue([{ kind: "Pod", apiVersion: "v1", aliases: ["pod", "pods"] }]);
+  mocks.listFiles.mockResolvedValue({ total: 1, returned: 1, files: [{ path: "report.txt" }] });
   ({ createServer } = await import("../src/tools.js"));
 });
 
@@ -112,6 +128,8 @@ describe("structured bundle tools", () => {
       namespace: "default",
       labels: { app: "web" },
       fields: { "status.phase": "Running" },
+      field_contains: { "metadata.name": "web" },
+      offset: 10,
       limit: 100,
       full: true,
     }).success).toBe(true);
@@ -126,6 +144,8 @@ describe("structured bundle tools", () => {
       name: "web-0",
       labels: { app: "web" },
       fields: { "status.phase": "Running" },
+      field_contains: { "metadata.name": "web" },
+      offset: 2,
       limit: 1,
       full: true,
     }) as { content: { text: string }[] };
@@ -138,21 +158,47 @@ describe("structured bundle tools", () => {
       name: "web-0",
       labels: { app: "web" },
       fields: { "status.phase": "Running" },
+      fieldContains: { "metadata.name": "web" },
+      offset: 2,
       limit: 1,
       full: true,
     });
   });
 
-  it("reads logs without kubectl", async () => {
+  it("fans out log searches through structured selectors", async () => {
     const result = await invoke(tool("pod_logs"), {
       namespace: "default",
-      pod: "web-0",
-      container: "app",
+      labels: { app: "web" },
+      search: "404",
       tail: 50,
     }) as { content: { text: string }[] };
 
-    expect(result.content[0]?.text).toBe("line\n");
-    expect(mocks.readLogs).toHaveBeenCalledWith("default", "web-0", "app", 50);
+    expect(JSON.parse(result.content[0]!.text).returned).toBe(1);
+    expect(mocks.queryLogs).toHaveBeenCalledWith({
+      namespace: "default",
+      pod: undefined,
+      container: undefined,
+      labels: { app: "web" },
+      search: "404",
+      ignoreCase: undefined,
+      tail: 50,
+      limit: undefined,
+    });
+  });
+
+  it("discovers resources and exposes bounded raw files", async () => {
+    const catalog = await invoke(tool("resource_catalog"), { search: "pod" }) as {
+      content: { text: string }[];
+    };
+    expect(JSON.parse(catalog.content[0]!.text)[0].kind).toBe("Pod");
+    expect(mocks.catalog).toHaveBeenCalledWith("pod");
+
+    const files = await invoke(tool("bundle_files"), {
+      operation: "list",
+      path: "host-collectors",
+    }) as { content: { text: string }[] };
+    expect(JSON.parse(files.content[0]!.text).total).toBe(1);
+    expect(mocks.listFiles).toHaveBeenCalledWith("host-collectors", undefined);
   });
 });
 

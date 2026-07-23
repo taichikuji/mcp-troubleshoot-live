@@ -13,10 +13,14 @@ import {
   bundleReady,
   currentBundlePath,
   isBundleActive,
+  listBundleContents,
   queryResources,
-  readPodLogs,
+  queryPodLogs,
+  readBundleContents,
   requireReady,
+  resourceCatalog,
   resolveBundlePath,
+  searchBundleContents,
   startBundle,
   stopBundle,
 } from "./bundle.js";
@@ -36,9 +40,11 @@ const INSTRUCTIONS = [
   "1. Call list_bundles. If the requested bundle is absent, use prepare_upload and run its returned command.",
   "2. Call start_bundle. If it reports loading, poll cluster_status until ready.",
   "3. Use cluster_overview first for general triage.",
-  "4. Use resource_query for Kubernetes objects and pod_logs for container logs.",
-  "5. Use full=true only when the complete object is needed; narrow by namespace/name/labels/fields.",
-  "6. Call stop_bundle when done.",
+  "4. Use resource_catalog when the requested resource name is unknown or version-specific.",
+  "5. Use resource_query for Kubernetes objects and pod_logs for label-based multi-container logs/search.",
+  "6. Use bundle_files only for diagnostics not represented as Kubernetes resources or pod logs.",
+  "7. Use full=true only when needed; narrow queries and follow nextOffset for more results.",
+  "8. Call stop_bundle when done.",
   "",
   "The tools read the immutable support bundle directly. There is no live cluster and no kubectl.",
 ].join("\n");
@@ -202,6 +208,20 @@ export function createServer(): McpServer {
   );
 
   server.registerTool(
+    "resource_catalog",
+    {
+      description:
+        "Discover resource kinds, API versions, and accepted aliases collected in the active bundle. Use this before guessing version-specific CR names.",
+      inputSchema: {
+        search: z.string().optional().describe("Optional kind, API group/version, or alias substring."),
+      },
+      annotations: { readOnlyHint: true, idempotentHint: true },
+    },
+    async ({ search }) => readyTool("resource_catalog", async () =>
+      textResult(JSON.stringify(resourceCatalog(search), null, 2))),
+  );
+
+  server.registerTool(
     "resource_query",
     {
       description:
@@ -212,13 +232,32 @@ export function createServer(): McpServer {
         namespace: z.string().optional(),
         name: z.string().optional(),
         labels: z.record(z.string()).optional().describe("Exact metadata label matches."),
-        fields: z.record(z.string()).optional().describe("Exact dot-path matches, e.g. status.phase."),
+        fields: z.record(z.string()).optional().describe(
+          "Exact dot-path matches, including array indexes such as spec.rules[0].matches[0].",
+        ),
+        field_contains: z.record(z.string()).optional().describe(
+          "Substring matches on dot-path values.",
+        ),
+        offset: z.number().int().nonnegative().optional().describe(
+          "Result offset. Use nextOffset from a truncated response.",
+        ),
         limit: z.number().int().positive().max(500).optional(),
         full: z.boolean().optional().describe("Return complete collected objects instead of summaries."),
       },
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
-    async ({ kind, api_version, namespace, name, labels, fields, limit, full }) =>
+    async ({
+      kind,
+      api_version,
+      namespace,
+      name,
+      labels,
+      fields,
+      field_contains,
+      offset,
+      limit,
+      full,
+    }) =>
       readyTool("resource_query", async () => {
         try {
           const result = await queryResources({
@@ -228,6 +267,8 @@ export function createServer(): McpServer {
             name,
             labels,
             fields,
+            fieldContains: field_contains,
+            offset,
             limit,
             full,
           });
@@ -241,22 +282,81 @@ export function createServer(): McpServer {
   server.registerTool(
     "pod_logs",
     {
-      description: "Read collected container logs from either standard support-bundle log layout.",
+      description:
+        "Read or search collected logs. Select one pod/container exactly, or fan out by pod labels across all collected containers.",
       inputSchema: {
-        namespace: z.string().min(1),
-        pod: z.string().min(1),
-        container: z.string().min(1),
+        namespace: z.string().min(1).optional(),
+        pod: z.string().min(1).optional(),
+        container: z.string().min(1).optional(),
+        labels: z.record(z.string()).optional().describe("Exact pod label matches."),
+        search: z.string().min(1).optional().describe("Literal text to find in collected logs."),
+        ignore_case: z.boolean().optional().describe("Case-insensitive search; default true."),
         tail: z.number().int().positive().max(10_000).optional(),
+        limit: z.number().int().positive().max(100).optional().describe("Maximum log files returned."),
       },
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
-    async ({ namespace, pod, container, tail }) => readyTool("pod_logs", async () => {
-      try {
-        return textResult(withSizeHint(await readPodLogs(namespace, pod, container, tail ?? 200)));
-      } catch (err) {
-        return errorResult(err instanceof Error ? err.message : String(err));
-      }
-    }),
+    async ({ namespace, pod, container, labels, search, ignore_case, tail, limit }) =>
+      readyTool("pod_logs", async () => {
+        if (!pod && !labels) {
+          return errorResult("Provide pod or labels to bound the log query.");
+        }
+        try {
+          return textResult(withSizeHint(JSON.stringify(await queryPodLogs({
+            namespace,
+            pod,
+            container,
+            labels,
+            search,
+            ignoreCase: ignore_case,
+            tail,
+            limit,
+          }), null, 2)));
+        } catch (err) {
+          return errorResult(err instanceof Error ? err.message : String(err));
+        }
+      }),
+  );
+
+  server.registerTool(
+    "bundle_files",
+    {
+      description:
+        "List, read, or literal-search raw support-bundle files not represented by resource_query or pod_logs. Reads and searches are bounded.",
+      inputSchema: {
+        operation: z.enum(["list", "read", "search"]),
+        path: z.string().optional().describe("Relative file path for read, or path prefix for list/search."),
+        query: z.string().min(1).optional().describe("Literal content query for search."),
+        ignore_case: z.boolean().optional(),
+        limit: z.number().int().positive().max(500).optional(),
+        max_bytes: z.number().int().positive().max(1024 * 1024).optional(),
+      },
+      annotations: { readOnlyHint: true, idempotentHint: true },
+    },
+    async ({ operation, path, query, ignore_case, limit, max_bytes }) =>
+      readyTool("bundle_files", async () => {
+        try {
+          if (operation === "list") {
+            return textResult(JSON.stringify(await listBundleContents(path, limit), null, 2));
+          }
+          if (operation === "read") {
+            if (!path) return errorResult("path is required for operation=read");
+            return textResult(withSizeHint(JSON.stringify(
+              await readBundleContents(path, max_bytes),
+              null,
+              2,
+            )));
+          }
+          if (!query) return errorResult("query is required for operation=search");
+          return textResult(withSizeHint(JSON.stringify(
+            await searchBundleContents(query, path, limit, ignore_case),
+            null,
+            2,
+          )));
+        } catch (err) {
+          return errorResult(err instanceof Error ? err.message : String(err));
+        }
+      }),
   );
 
   return server;
